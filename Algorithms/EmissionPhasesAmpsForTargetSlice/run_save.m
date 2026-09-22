@@ -1,0 +1,12 @@
+targetfile = 'smiley.png';
+targetAmp = double( rgb2gray( imread(targetfile) ) );
+targetAmp = targetAmp / max(max(targetAmp));
+[amps, phases, ampSlice] = calcEmissionForTargetAmpSlice(targetAmp, 0.16, 50, 0.16, 40000,340,0.005, 0, 32);
+fig = figure('Visible','off');
+subplot(2,1,1); imagesc(targetAmp); title('target'); axis image;
+subplot(2,1,2); imagesc(ampSlice); title('obtained'); axis image;
+saveas(fig, 'matlab_result.png');
+targetAmp = targetAmp ./ max(max(targetAmp));
+ampSlice = ampSlice ./ max(max(ampSlice));
+mse = sum(sum( (targetAmp-ampSlice).^2 )) ./ numel(ampSlice);
+disp(['MSE = ' num2str(mse)]);

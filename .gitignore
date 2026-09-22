@@ -1,0 +1,14 @@
+# Quartus 编译产物(每次编译重新生成)
+db/
+incremental_db/
+output_files/
+*.qws
+*.bak
+serv_req_info.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# 临时/草稿文件
+0,0,0*.txt
