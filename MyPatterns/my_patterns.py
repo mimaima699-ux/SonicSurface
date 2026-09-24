@@ -517,6 +517,50 @@ def tap(board, dist=0.12, pulse=0.05, count=1, gap=0.3):
     print(f"tap 完成: {count} 次 x {pulse*1000:.0f}ms 脉冲")
 
 
+def hold(board, dist=0.12, freq=100.0, duty=0.7, pattern=None):
+    """持续调制发射:burst 的不限时版本。
+    焦点/图案与关闭图预装双缓冲,循环 commit 互换产生 freq Hz 幅度调制,
+    直到用户按回车或 Ctrl+C 才停止。期间可最小化窗口,但进程须保持运行。
+    硬件应力低于连续悬浮模式(平均功率仅 duty),长时间运行安全;
+    注意 Python 忙等会占约一个 CPU 核。"""
+    import threading
+
+    ph = phases_focus((0.0, dist, 0.0)) if pattern is None else pattern
+    stop = threading.Event()
+    n = [0]
+
+    def loop():
+        offp = np.full(N_EMITTERS, np.nan)
+        board.send(ph)          # A(图案)入前台
+        board.send(offp)        # B(关闭)入前台,A 转后台 —— 此刻静默
+        t_on = duty / freq
+        t_off = (1.0 - duty) / freq
+        while not stop.is_set():
+            board.send_commit()                     # → 开
+            n[0] += 1
+            target = time.perf_counter() + t_on
+            while time.perf_counter() < target:
+                pass
+            board.send_commit()                     # → 关
+            target = time.perf_counter() + t_off
+            while time.perf_counter() < target:
+                pass
+        board.off()
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    print(f"hold: {freq:.0f}Hz / {duty:.0%} 持续调制发射中(焦点 {dist*100:.0f}cm)...")
+    print("按回车停止并关闭发射")
+    try:
+        input()
+    except (KeyboardInterrupt, EOFError):
+        pass
+    finally:
+        stop.set()
+        t.join(timeout=2.0)
+        print(f"已停止(共 {n[0]} 个调制周期)。硬件应力提示:本模式比悬浮更轻,可长时间运行。")
+
+
 # ======================================================================
 # 五、命令行
 # ======================================================================
@@ -597,6 +641,10 @@ def _build_parser():
     s.add_argument("--count", type=int, default=1, help="连续点几下")
     s.add_argument("--gap", type=float, default=0.3, help="多次点击间隔 [s]")
 
+    s = sp("hold", help="持续调制发射(burst 不限时版):按回车才停")
+    s.add_argument("--freq", type=float, default=100.0, help="调制频率 Hz(实测 100~200 体感最强)")
+    s.add_argument("--duty", type=float, default=0.7, help="开通占空比 0.1~0.9")
+
     s = sp("anim", help="动画")
     s.add_argument("type", choices=("orbit", "scan", "spin", "mpx", "images"))
     s.add_argument("--kind", choices=("focus", "vortex", "twin"), default="focus")
@@ -656,6 +704,9 @@ def main(argv=None):
     elif args.cmd == "tap":
         phases, title = phases_focus((0.0, args.dist, 0.0)), f"tap @{args.dist:.2f}m"
         targets = [(0.0, args.dist, 0.0)]
+    elif args.cmd == "hold":
+        phases, title = phases_focus((0.0, args.dist, 0.0)), f"hold @{args.dist:.2f}m"
+        targets = [(0.0, args.dist, 0.0)]
     elif args.cmd == "anim":
         title = f"anim {args.type}"
         phases = None
@@ -683,6 +734,8 @@ def main(argv=None):
             burst(b, dist=args.dist, dur=args.dur, freq=args.freq, duty=args.duty)
         elif args.cmd == "tap":
             tap(b, dist=args.dist, pulse=args.pulse, count=args.count, gap=args.gap)
+        elif args.cmd == "hold":
+            hold(b, dist=args.dist, freq=args.freq, duty=args.duty)
         elif args.cmd == "anim":
             if args.type == "orbit":
                 frames = frames_orbit(args.dist, args.radius, args.n, args.kind, m=args.m)

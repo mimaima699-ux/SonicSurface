@@ -48,6 +48,7 @@ py -3.13 MyPatterns/my_patterns.py vortex 0 0 --m 2 --preview --port COM4
 | `steer A` | 波束偏转 A 度(仅小角度) | `steer 8` |
 | `burst [--dur 1.5] [--freq 200]` | 持续调制触觉爆发(双缓冲 253 高频互换实现 AM)。**嗡鸣 ∝ f²,想安静用 `--freq 40`** | `burst --port COM7 --dist 0.12 --freq 40` |
 | `tap [--pulse 0.05] [--count 1]` | **单击脉冲**:50ms 全功率焦点,无调制→几乎无声,只有轻"嗒",像被按了一下 | `tap --port COM7 --count 3` |
+| `hold [--freq 100] [--duty 0.7]` | **持续调制发射**(burst 不限时版):100Hz 嗡到你按回车为止。硬件应力低于悬浮模式,可长时间运行;Python 进程须保持(忙等约占一个核) | `hold --port COM7 --dist 0.12 --freq 100` |
 | `anim orbit/scan/spin/mpx/images` | 动画(Ctrl+C 停止并关发射) | `anim orbit --kind vortex --port COM4` |
 | `off` | 关闭发射 | `off` |
 
