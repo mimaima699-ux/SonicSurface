@@ -1,0 +1,87 @@
+{
+  "image": "Algorithms\\EmissionPhasesAmpsForTargetSlice\\curve.png",
+  "distance_m": 0.16,
+  "evaluation_grid": [
+    96,
+    96
+  ],
+  "reference_scale": 224.3310557436159,
+  "baseline": {
+    "stroke_mean": 1.0000000000000002,
+    "stroke_p10": 0.7375474910372759,
+    "stroke_cv": 0.2096375270208643,
+    "stroke_texture": 0.10246644662717444,
+    "background_mean": 0.11070645082807122,
+    "background_top_1pct": 0.6836556164705437,
+    "background_max": 1.013018801694067
+  },
+  "gradient": {
+    "stroke_mean": 0.9972592166341515,
+    "stroke_p10": 0.7487028004076323,
+    "stroke_cv": 0.1956817683273861,
+    "stroke_texture": 0.10221444692393433,
+    "background_mean": 0.11485157289440753,
+    "background_top_1pct": 0.6564879517215101,
+    "background_max": 0.982244003111899
+  },
+  "gradient_smooth": {
+    "stroke_mean": 0.9911674542391647,
+    "stroke_p10": 0.7652129381724354,
+    "stroke_cv": 0.17880376064162665,
+    "stroke_texture": 0.09924317462302791,
+    "background_mean": 0.11929910490567497,
+    "background_top_1pct": 0.6449844456552303,
+    "background_max": 0.9184864053254974
+  },
+  "optimization": {
+    "selected_seed": 0,
+    "selected_kind": "gradient",
+    "baseline_metrics": {
+      "stroke_mean": 1.0000000000000002,
+      "stroke_p10": 0.7375474910372759,
+      "stroke_cv": 0.2096375270208643,
+      "stroke_texture": 0.10246644662717444,
+      "background_mean": 0.11070645082807122,
+      "background_top_1pct": 0.6836556164705437,
+      "background_max": 1.013018801694067
+    },
+    "selected_metrics": {
+      "stroke_mean": 0.9972592166341515,
+      "stroke_p10": 0.7487028004076323,
+      "stroke_cv": 0.1956817683273861,
+      "stroke_texture": 0.10221444692393433,
+      "background_mean": 0.11485157289440753,
+      "background_top_1pct": 0.6564879517215101,
+      "background_max": 0.982244003111899
+    }
+  },
+  "smooth_optimization": {
+    "selected_seed": 0,
+    "selected_kind": "gradient_smooth",
+    "baseline_metrics": {
+      "stroke_mean": 1.0000000000000002,
+      "stroke_p10": 0.7375474910372759,
+      "stroke_cv": 0.2096375270208643,
+      "stroke_texture": 0.10246644662717444,
+      "background_mean": 0.11070645082807122,
+      "background_top_1pct": 0.6836556164705437,
+      "background_max": 1.013018801694067
+    },
+    "selected_metrics": {
+      "stroke_mean": 0.9911674542391647,
+      "stroke_p10": 0.7652129381724354,
+      "stroke_cv": 0.17880376064162665,
+      "stroke_texture": 0.09924317462302791,
+      "background_mean": 0.11929910490567497,
+      "background_top_1pct": 0.6449844456552303,
+      "background_max": 0.9184864053254974
+    }
+  },
+  "seconds": {
+    "gs": 0.22213919999921927,
+    "gradient": 1.1432698999997228,
+    "gradient_smooth": 1.330050000004121,
+    "evaluation_and_plot": 0.559569900004135
+  },
+  "note": "Model prediction only; both phase vectors quantized to 32 bins."
+}

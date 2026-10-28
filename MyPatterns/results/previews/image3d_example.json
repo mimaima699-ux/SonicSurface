@@ -1,0 +1,67 @@
+{
+  "evaluation_grid": [
+    80,
+    80
+  ],
+  "reference_scale": 105.78440601640494,
+  "layers": [
+    {
+      "stroke_mean": 1.1291976312216894,
+      "stroke_p10": 0.7003109921991264,
+      "stroke_cv": 0.33657209351900197,
+      "stroke_texture": 0.2082708566763052,
+      "background_mean": 0.38923868155701513,
+      "background_top_1pct": 1.0235100204853007,
+      "background_max": 1.4919401274564357,
+      "shared_scale_mse": 0.19363312948189226,
+      "depth_m": 0.12,
+      "image": "MyPatterns\\demo_F.png",
+      "other_layer_stroke_mean": [
+        0.8074401199434648
+      ]
+    },
+    {
+      "stroke_mean": 0.8708023687783107,
+      "stroke_p10": 0.5051492336881427,
+      "stroke_cv": 0.3949521373379521,
+      "stroke_texture": 0.1603901696498624,
+      "background_mean": 0.2727162025046167,
+      "background_top_1pct": 0.737054544905343,
+      "background_max": 0.9368864575411721,
+      "shared_scale_mse": 0.10136240906070562,
+      "depth_m": 0.16,
+      "image": "Algorithms\\EmissionPhasesAmpsForTargetSlice\\A.png",
+      "other_layer_stroke_mean": [
+        0.9868144476392126
+      ]
+    }
+  ],
+  "optimization": {
+    "optimization_seconds": 0.12048179999692366,
+    "iterations": 160,
+    "initial_score": 1.5066100332132621,
+    "selected_score": 0.4236365068946795,
+    "reference_scale": 92.4086737847081,
+    "grid": [
+      40,
+      40
+    ],
+    "single_focus_reference": [
+      {
+        "focus_depth_m": 0.12,
+        "relative_amplitude_at_depths": [
+          1.0,
+          0.2151511098980472
+        ]
+      },
+      {
+        "focus_depth_m": 0.16,
+        "relative_amplitude_at_depths": [
+          0.29186609734312663,
+          1.0
+        ]
+      }
+    ]
+  },
+  "note": "Offline model prediction after 32-bin phase quantization; not tactile measurement."
+}

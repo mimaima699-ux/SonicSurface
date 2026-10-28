@@ -1,0 +1,189 @@
+{
+  "points": [
+    [
+      -0.02978,
+      0.11789,
+      -0.00355
+    ],
+    [
+      -0.02851,
+      0.11761,
+      0.00373
+    ],
+    [
+      -0.03,
+      0.10933,
+      0.00373
+    ],
+    [
+      -0.02701,
+      0.10928,
+      -0.00373
+    ],
+    [
+      -0.03,
+      0.10187,
+      -0.00373
+    ],
+    [
+      -0.02419,
+      0.1,
+      0.00373
+    ],
+    [
+      -0.02032,
+      0.1,
+      -0.00373
+    ],
+    [
+      -0.01279,
+      0.10299,
+      -0.00373
+    ],
+    [
+      -0.00494,
+      0.10299,
+      -0.00373
+    ],
+    [
+      0.00291,
+      0.10299,
+      -0.00373
+    ],
+    [
+      0.00291,
+      0.10299,
+      0.00373
+    ],
+    [
+      0.00871,
+      0.1,
+      0.00373
+    ],
+    [
+      0.01273,
+      0.10299,
+      -0.00373
+    ],
+    [
+      0.02032,
+      0.1,
+      -0.00373
+    ],
+    [
+      0.01839,
+      0.1,
+      0.00373
+    ],
+    [
+      0.02478,
+      0.10522,
+      0.00373
+    ],
+    [
+      0.03,
+      0.1,
+      0.00373
+    ],
+    [
+      0.03,
+      0.1,
+      -0.00373
+    ],
+    [
+      0.0259,
+      0.10634,
+      -0.00373
+    ],
+    [
+      0.03,
+      0.11119,
+      0.00373
+    ],
+    [
+      0.02851,
+      0.11782,
+      0.00329
+    ],
+    [
+      0.02724,
+      0.11789,
+      -0.00355
+    ],
+    [
+      -0.0029,
+      0.1,
+      0.00373
+    ],
+    [
+      -0.01452,
+      0.1,
+      0.00373
+    ]
+  ],
+  "labels": [
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature",
+    "feature"
+  ],
+  "frame_count": 24,
+  "fps": 20.0,
+  "cycle_seconds_at_requested_fps": 1.2,
+  "serial_minimum_seconds_230400_8n1": 0.26875,
+  "phase_generation_seconds": 0.0003780000115511939,
+  "mean_single_focus_peak_intensity": 1492179.0094263982,
+  "maximum_time_average_to_single_focus_peak": 0.10479980107023526,
+  "note": "Offline time average of 32-bin single-focus frames. Not a simultaneous field or measured tactile 3D shape.",
+  "model": {
+    "path": "Mech\\two arrays support\\leg.stl",
+    "source": "feature",
+    "requested_points": 24,
+    "selected_points": 24,
+    "input_bounds": [
+      -420.5,
+      -219.49998474121094,
+      310.5,
+      335.5,
+      -50.0,
+      10.0
+    ],
+    "meters_per_model_unit": 0.0002985074243042618,
+    "near_m": 0.1,
+    "physical_bounds_m": {
+      "x": [
+        -0.03,
+        0.03
+      ],
+      "depth_y": [
+        0.1,
+        0.11789
+      ],
+      "z": [
+        -0.00373,
+        0.00373
+      ]
+    },
+    "maximum_jump_m": 0.03579762701632609
+  }
+}

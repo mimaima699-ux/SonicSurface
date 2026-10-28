@@ -1,0 +1,67 @@
+{
+  "mode": "sequential",
+  "layers": [
+    {
+      "stroke_mean": 1.1472842779801602,
+      "stroke_p10": 0.7626985130269145,
+      "stroke_cv": 0.25282222662617787,
+      "stroke_texture": 0.1610826815884758,
+      "background_mean": 0.1588874841816151,
+      "background_top_1pct": 0.6286751379613553,
+      "background_max": 0.8197578267545657,
+      "shared_scale_mse": 0.0496820985728062,
+      "other_depth_stroke_mean": [
+        1.015087816044527
+      ],
+      "depth_contrast_ratio": [
+        1.1302315522323583
+      ],
+      "image": "MyPatterns\\demo_F.png",
+      "depth_m": 0.12
+    },
+    {
+      "stroke_mean": 0.8527157220198397,
+      "stroke_p10": 0.5339517733938413,
+      "stroke_cv": 0.2692037372774981,
+      "stroke_texture": 0.09710401281634339,
+      "background_mean": 0.1369942530327118,
+      "background_top_1pct": 0.4854555252096908,
+      "background_max": 0.6682230490473062,
+      "shared_scale_mse": 0.033966997035807606,
+      "other_depth_stroke_mean": [
+        0.7709711954423866
+      ],
+      "depth_contrast_ratio": [
+        1.1060279904887338
+      ],
+      "image": "Algorithms\\EmissionPhasesAmpsForTargetSlice\\A.png",
+      "depth_m": 0.16
+    }
+  ],
+  "reference_scale": 133.68197103857395,
+  "evaluation_grid": [
+    80,
+    80
+  ],
+  "generation_seconds": {
+    "total_seconds": 0.3099762999918312,
+    "method": "2D array GS per depth",
+    "single_focus_reference": [
+      {
+        "focus_depth_m": 0.12,
+        "relative_amplitude_at_depths": [
+          1.0,
+          0.2151511098980472
+        ]
+      },
+      {
+        "focus_depth_m": 0.16,
+        "relative_amplitude_at_depths": [
+          0.29186609734312663,
+          1.0
+        ]
+      }
+    ]
+  },
+  "note": "Each GS frame is evaluated separately after 32-bin quantization; not simultaneous 3D or measured touch."
+}

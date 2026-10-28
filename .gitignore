@@ -12,3 +12,7 @@ __pycache__/
 
 # 临时/草稿文件
 0,0,0*.txt
+
+# Local camera settings, calibration attempts, and snapshots
+MyPatterns/results/hand_tracking/*
+!MyPatterns/results/hand_tracking/.gitkeep

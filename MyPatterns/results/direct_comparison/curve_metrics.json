@@ -1,0 +1,77 @@
+{
+  "image": "Algorithms\\EmissionPhasesAmpsForTargetSlice\\curve.png",
+  "distance_m": 0.16,
+  "evaluation_grid": [
+    128,
+    128
+  ],
+  "reference_scale": 224.26894927188943,
+  "metrics": {
+    "array": {
+      "stroke_mean": 1.0,
+      "stroke_p10": 0.7451460316869349,
+      "stroke_cv": 0.210557508633598,
+      "stroke_texture": 0.08545927762658538,
+      "background_mean": 0.11152970485087345,
+      "background_top_1pct": 0.6950962197597909,
+      "background_max": 1.069663722775402,
+      "shared_scale_mse": 0.02881013182825939
+    },
+    "gradient": {
+      "stroke_mean": 0.9970490358372777,
+      "stroke_p10": 0.751893818644032,
+      "stroke_cv": 0.19650711243185856,
+      "stroke_texture": 0.08536949622265115,
+      "background_mean": 0.11569283470625805,
+      "background_top_1pct": 0.6722098486730682,
+      "background_max": 1.0365420868591684,
+      "shared_scale_mse": 0.029104782696781493
+    },
+    "gradient_smooth": {
+      "stroke_mean": 0.9909064119081398,
+      "stroke_p10": 0.7642346122316477,
+      "stroke_cv": 0.17952630489163343,
+      "stroke_texture": 0.08323552829187086,
+      "background_mean": 0.1201378834188292,
+      "background_top_1pct": 0.6618873849569343,
+      "background_max": 0.9767479627171913,
+      "shared_scale_mse": 0.02967665951936674
+    },
+    "backprop": {
+      "stroke_mean": 0.9766245034715231,
+      "stroke_p10": 0.6513225328753767,
+      "stroke_cv": 0.28771632172637707,
+      "stroke_texture": 0.10450855789881043,
+      "background_mean": 0.11885375621670023,
+      "background_top_1pct": 0.6301817310484911,
+      "background_max": 1.1353899596001085,
+      "shared_scale_mse": 0.031134364266121886
+    },
+    "direct": {
+      "stroke_mean": 0.8082502848468363,
+      "stroke_p10": 0.6678442885828594,
+      "stroke_cv": 0.11762103236496654,
+      "stroke_texture": 0.05552066189675739,
+      "background_mean": 0.14693564951134205,
+      "background_top_1pct": 0.5121521012122632,
+      "background_max": 0.6279456670158375,
+      "shared_scale_mse": 0.030951282508569093
+    }
+  },
+  "seconds": {
+    "array": 0.15113850000489037,
+    "gradient": 0.8799437999987276,
+    "gradient_smooth": 1.0785449999966659,
+    "backprop": 0.10957430000416934,
+    "direct": 0.22856689999753144,
+    "evaluation_and_plot": 0.6906869000085862
+  },
+  "direct_optimization": {
+    "iterations": 100,
+    "initial_score": 0.2913933771279449,
+    "optimized_score": 0.12238881958817815,
+    "selected_score": 0.12238881958817815,
+    "used_optimization": true
+  },
+  "note": "Model prediction only; all methods use 32-bin phases and the GS stroke-mean scale."
+}

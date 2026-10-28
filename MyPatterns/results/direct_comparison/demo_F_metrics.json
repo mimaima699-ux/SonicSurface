@@ -1,0 +1,77 @@
+{
+  "image": "MyPatterns\\demo_F.png",
+  "distance_m": 0.16,
+  "evaluation_grid": [
+    128,
+    128
+  ],
+  "reference_scale": 155.2695776047569,
+  "metrics": {
+    "array": {
+      "stroke_mean": 1.0,
+      "stroke_p10": 0.6694530520265188,
+      "stroke_cv": 0.25863464639231554,
+      "stroke_texture": 0.09368272984300122,
+      "background_mean": 0.14089579833258406,
+      "background_top_1pct": 0.6995231365583116,
+      "background_max": 0.9994326495375649,
+      "shared_scale_mse": 0.03719560608741156
+    },
+    "gradient": {
+      "stroke_mean": 1.0297144792270274,
+      "stroke_p10": 0.722818611460266,
+      "stroke_cv": 0.21380357861765492,
+      "stroke_texture": 0.07732406531715313,
+      "background_mean": 0.14653310796341637,
+      "background_top_1pct": 0.5891812218522096,
+      "background_max": 0.7287143825490013,
+      "shared_scale_mse": 0.03266990406907284
+    },
+    "gradient_smooth": {
+      "stroke_mean": 1.0288772299477855,
+      "stroke_p10": 0.7432031532545443,
+      "stroke_cv": 0.2000088401442738,
+      "stroke_texture": 0.07363972702998184,
+      "background_mean": 0.15118936207012137,
+      "background_top_1pct": 0.6021168043101729,
+      "background_max": 0.7364152528960446,
+      "shared_scale_mse": 0.03329234438614795
+    },
+    "backprop": {
+      "stroke_mean": 0.9341782337494692,
+      "stroke_p10": 0.5151796124269136,
+      "stroke_cv": 0.38645497948290053,
+      "stroke_texture": 0.07867571810084817,
+      "background_mean": 0.19623951832957592,
+      "background_top_1pct": 0.9140081716602311,
+      "background_max": 1.139388653756675,
+      "shared_scale_mse": 0.07270206047369139
+    },
+    "direct": {
+      "stroke_mean": 0.8326361054646876,
+      "stroke_p10": 0.6574816158559456,
+      "stroke_cv": 0.14087365049714648,
+      "stroke_texture": 0.044245529180190236,
+      "background_mean": 0.19797022323313307,
+      "background_top_1pct": 0.5392391332112264,
+      "background_max": 0.6246531732084133,
+      "shared_scale_mse": 0.04579388674785845
+    }
+  },
+  "seconds": {
+    "array": 0.165791999999783,
+    "gradient": 1.151567900000373,
+    "gradient_smooth": 1.1762967000104254,
+    "backprop": 0.10839819999819156,
+    "direct": 0.2053169999999227,
+    "evaluation_and_plot": 0.679309999992256
+  },
+  "direct_optimization": {
+    "iterations": 100,
+    "initial_score": 0.4709008272171473,
+    "optimized_score": 0.11270943794094529,
+    "selected_score": 0.11270943794094529,
+    "used_optimization": true
+  },
+  "note": "Model prediction only; all methods use 32-bin phases and the GS stroke-mean scale."
+}
