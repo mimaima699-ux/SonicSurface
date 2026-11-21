@@ -9,7 +9,9 @@ from unittest.mock import patch
 import numpy as np
 
 import my_patterns
-from my_patterns import Board, Modulator, burst, hold, phases_trap, pattern_for_kind
+from my_patterns import (Board, Modulator, burst, focus_probe_points, hold,
+                         phases_trap, pattern_for_kind, probe_field_peaks,
+                         run_focus_probe)
 
 
 class FakeSerial:
@@ -69,6 +71,15 @@ def make_board(write_delay=0.0):
 
 
 class BoardTests(unittest.TestCase):
+    def test_phase_payload_changes_for_off_axis_focus(self):
+        center = my_patterns.phase_payload(my_patterns.phases_focus((0.0, 0.12, 0.0)))
+        off_axis = my_patterns.phase_payload(my_patterns.phases_focus((0.04, 0.12, 0.0)))
+        self.assertEqual(len(center), 256)
+        self.assertGreater(sum(a != b for a, b in zip(center, off_axis)), 200)
+        board, fake = make_board()
+        board.send(my_patterns.phases_focus((0.04, 0.12, 0.0)))
+        self.assertEqual(list(parse_frames(fake.stream))[0][1], off_axis)
+
     def test_send_encoding_unchanged(self):
         board, fake = make_board()
         board.send(phases_trap((0.0, 0.12, 0.0), maxiter=10))
@@ -123,6 +134,124 @@ class BoardTests(unittest.TestCase):
         for kind, _ in frames:
             counts[kind] += 1
         self.assertEqual(counts, {"pattern": n_patterns, "commit": n_commits})
+
+
+class FocusProbeTests(unittest.TestCase):
+    def test_probe_can_emit_explicit_experimental_phases(self):
+        board, fake = make_board()
+        run_focus_probe(board, focus_probe_points()[:1], 0.1,
+                        read_input=lambda _: "", wait=lambda _: None,
+                        phase_for_position=lambda _: np.zeros(256))
+        frames = [payload for kind, payload in parse_frames(fake.stream)
+                  if kind == "pattern"]
+        self.assertEqual(frames[1], bytes(256))
+        self.assertEqual(frames[-1], bytes([32]) * 256)
+
+    def test_probe_points_and_off_between_stages(self):
+        points = focus_probe_points(0.12, 0.04)
+        self.assertEqual([name for name, _ in points],
+                         ["CENTER", "+X", "-X", "+Z", "-Z"])
+        board, fake = make_board()
+        answers = iter(["", "", "q"])
+        run_focus_probe(board, points, 0.1, read_input=lambda _: next(answers),
+                        wait=lambda _: None)
+        frames = [payload for kind, payload in parse_frames(fake.stream)
+                  if kind == "pattern"]
+        self.assertEqual(len(frames), 6)
+        self.assertTrue(all(payload == bytes([32]) * 256
+                            for payload in frames[::2]))
+        self.assertTrue(all(payload != bytes([32]) * 256
+                            for payload in frames[1:4:2]))
+        self.assertEqual(frames[-1], bytes([32]) * 256)
+
+    def test_live_update_probe_reuses_modulator_and_turns_off_between_stages(self):
+        board, fake = make_board()
+        points = focus_probe_points(0.12, 0.04)[:2]
+        run_focus_probe(board, points, 0.1,
+                        read_input=lambda _: "", wait=lambda _: None,
+                        freq=200, duty=0.2, live_update=True)
+        frames = [payload for kind, payload in parse_frames(fake.stream)
+                  if kind == "pattern"]
+        off = bytes([32]) * 256
+        center = my_patterns.phase_payload(my_patterns.phases_focus(points[0][1]))
+        side = my_patterns.phase_payload(my_patterns.phases_focus(points[1][1]))
+        self.assertEqual(frames[:3], [off, off, off])
+        self.assertEqual(frames[3:7], [center, off, off, off])
+        self.assertEqual(frames[7:11], [side, off, off, off])
+        self.assertEqual(frames[-1], off)
+
+    def test_live_update_probe_stops_on_interrupt(self):
+        board, fake = make_board()
+
+        def interrupt(_):
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_focus_probe(board, focus_probe_points()[:1], 0.1,
+                            read_input=lambda _: "", wait=interrupt,
+                            freq=200, duty=0.2, live_update=True)
+        frames = [payload for kind, payload in parse_frames(fake.stream)
+                  if kind == "pattern"]
+        self.assertEqual(frames[-1], bytes([32]) * 256)
+
+    def test_probe_turns_off_on_interrupted_wait(self):
+        board, fake = make_board()
+
+        def interrupt(_):
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_focus_probe(board, focus_probe_points()[:1], 0.1,
+                            read_input=lambda _: "", wait=interrupt)
+        frames = [payload for kind, payload in parse_frames(fake.stream)
+                  if kind == "pattern"]
+        self.assertEqual(frames[-1], bytes([32]) * 256)
+
+    def test_modulated_probe_stops_thread_and_turns_off_on_interrupt(self):
+        board, fake = make_board()
+        modulators = []
+
+        class FakeModulator:
+            error = None
+
+            def __init__(self, board, phases, freq, duty):
+                self.freq, self.duty = freq, duty
+                self.stopped = False
+                modulators.append(self)
+
+            def start(self):
+                return self
+
+            def stop(self):
+                self.stopped = True
+
+        def interrupt(_):
+            raise KeyboardInterrupt
+
+        with patch("my_patterns.Modulator", FakeModulator):
+            with self.assertRaises(KeyboardInterrupt):
+                run_focus_probe(board, focus_probe_points()[:1], 8,
+                                read_input=lambda _: "", wait=interrupt,
+                                freq=200, duty=0.2)
+        self.assertEqual(len(modulators), 1)
+        self.assertTrue(modulators[0].stopped)
+        self.assertEqual((modulators[0].freq, modulators[0].duty), (200, 0.2))
+        frames = [payload for kind, payload in parse_frames(fake.stream)
+                  if kind == "pattern"]
+        self.assertEqual(frames[-1], bytes([32]) * 256)
+
+    def test_probe_rejects_unbounded_duration_and_duty(self):
+        board, _ = make_board()
+        with self.assertRaises(ValueError):
+            run_focus_probe(board, [], 16)
+        with self.assertRaises(ValueError):
+            run_focus_probe(board, [], 8, freq=200, duty=0.7)
+
+    def test_model_reports_remote_peak_for_off_axis_focus(self):
+        main, remote, ratio = probe_field_peaks((0.05, 0.12, 0.0))
+        self.assertAlmostEqual(main[0], 0.05, delta=0.005)
+        self.assertGreater(np.linalg.norm(main[[0, 2]] - remote[[0, 2]]), 0.02)
+        self.assertGreater(ratio, 0.25)
 
 
 class ModulatorTests(unittest.TestCase):

@@ -2,6 +2,8 @@
 
 import unittest
 import time
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -21,6 +23,116 @@ class RecorderBoard:
 
     def off(self):
         self.send(np.full(256, np.nan))
+
+    def close(self):
+        pass
+
+
+class ViewerSnapshotTests(unittest.TestCase):
+    def test_phase_diagnostic_reports_commanded_payload(self):
+        import my_patterns
+        from hand_track import phase_diagnostic
+
+        center = (0.0, 0.12, 0.0)
+        side = (0.04, 0.12, 0.0)
+        _, first = phase_diagnostic(center, my_patterns.phases_focus(center))
+        line, second = phase_diagnostic(
+            side, my_patterns.phases_focus(side), first)
+        changed = sum(a != b for a, b in zip(first, second))
+        self.assertIn("x=+0.040", line)
+        self.assertIn(f"changed={changed}/256", line)
+        self.assertIn(f"vs_center={changed}/256", line)
+        self.assertEqual(second, my_patterns.phase_payload(
+            my_patterns.phases_focus(side)))
+
+    @staticmethod
+    def tracking_scene():
+        from hand_track import RealSenseSource
+
+        calib = {"version": 2, "mode": "realsense_3d", "R": np.eye(3).tolist(),
+                 "t": [0, 0, 0], "target": "index_tip", "rms_mm": 1,
+                 "max_mm": 2, "frame_size": [640, 480], "stream": "color"}
+        points = np.full((21, 2), (320.0, 240.0))
+        obs = HandObservation(points, hand_mask_from_landmarks(points, (480, 640, 3)))
+        frame = np.zeros((480, 640, 3), np.uint8)
+        cap = object.__new__(RealSenseSource)
+        cap.stream_name = "color"
+        cap.serial = "test-camera"
+        cap.read = lambda: (True, frame)
+        cap.release = lambda: None
+        cap.point_3d = lambda uv, mask: np.array([0.01, 0.12, -0.02])
+        return calib, obs, cap
+
+    def test_phase_snapshot_tracks_the_last_emitted_pattern_and_off(self):
+        emitted = []
+        follower = PalmFollower(lambda phases: emitted.append(np.asarray(phases).copy()))
+        self.assertIsNone(follower.phase_snapshot())
+        follower.feed(1.0, (0.0, 0.12, 0.0))
+        np.testing.assert_allclose(follower.phase_snapshot(), emitted[-1])
+        follower.pause(1.1)
+        self.assertIsNone(follower.phase_snapshot())
+
+    def test_3d_view_rejects_sim_without_camera(self):
+        with self.assertRaisesRegex(SystemExit, "--view-3d"):
+            run_tracking(sim=True, dry=True, view_3d=True)
+
+    def test_tracking_sends_measured_and_commanded_points_to_3d_view(self):
+        calib, obs, cap = self.tracking_scene()
+        with patch("hand_track.open_source", return_value=(cap, "realsense")), \
+                patch("hand_track.PalmDetector") as detector, \
+                patch("live_diagnostic_3d.LiveDiagnostic3D") as viewer, \
+                patch("builtins.print") as printed, \
+                patch("cv2.destroyAllWindows"):
+            detector.return_value.detect.return_value = obs
+            viewer.return_value.poll.return_value = True
+            viewer.return_value.consume_pause_toggle.return_value = False
+            viewer.return_value.update.return_value = False
+            run_tracking(calib=calib, dry=True, realsense=True,
+                         view_3d=True, phase_trace=True)
+        args = viewer.return_value.update.call_args.args
+        np.testing.assert_allclose(args[4], [0.01, 0.12, -0.02])
+        np.testing.assert_allclose(args[5], [0.01, 0.12, -0.02])
+        self.assertEqual(np.asarray(args[6]).shape, (256,))
+        self.assertEqual(args[7], "inside")
+        self.assertTrue(any("[phase dry]" in call.args[0]
+                            for call in printed.call_args_list))
+        viewer.return_value.close.assert_called_once()
+
+    def test_space_freezes_without_new_camera_frames_and_silences_board(self):
+        calib, obs, cap = self.tracking_scene()
+        board = RecorderBoard()
+        reads = []
+        frame = np.zeros((480, 640, 3), np.uint8)
+
+        def read():
+            reads.append(len(reads) + 1)
+            return True, frame
+
+        cap.read = read
+        keys = iter((ord(" "), -1, ord(" "), ord("q")))
+        with patch("hand_track.open_source", return_value=(cap, "realsense")), \
+                patch("hand_track.PalmDetector") as detector, \
+                patch("hand_track.Board", return_value=board), \
+                patch("hand_track.LossSupervisor") as supervisor, \
+                patch("live_diagnostic_3d.LiveDiagnostic3D") as viewer, \
+                patch("hand_track.open_preview_window"), \
+                patch("cv2.setMouseCallback"), patch("cv2.imshow"), \
+                patch("cv2.waitKey", side_effect=lambda _delay: next(keys)), \
+                patch("cv2.destroyAllWindows"):
+            detector.return_value.detect.return_value = obs
+            supervisor.return_value.start.return_value = supervisor.return_value
+            supervisor.return_value.error = None
+            viewer.return_value.poll.return_value = True
+            viewer.return_value.consume_pause_toggle.return_value = False
+            viewer.return_value.update.return_value = True
+            run_tracking(calib=calib, port="COM_FAKE", no_mod=True,
+                         realsense=True, view_3d=True)
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(detector.return_value.detect.call_count, 2)
+        self.assertGreaterEqual(sum(np.isnan(p).all() for p in board.frames), 1)
+        viewer.return_value.set_paused.assert_any_call(True)
+        viewer.return_value.set_paused.assert_any_call(False)
+        viewer.return_value.close.assert_called_once()
 
 
 def circle_samples(seconds=8.0, fps=30.0, radius=0.05, noise=0.002,
@@ -82,7 +194,8 @@ class BoundsTests(unittest.TestCase):
         from hand_track import DEFAULT_BOUNDS
         self.assertTrue(in_bounds((0.0, 0.12, 0.0), DEFAULT_BOUNDS))
         self.assertFalse(in_bounds((0.09, 0.12, 0.0), DEFAULT_BOUNDS))
-        self.assertFalse(in_bounds((0.0, 0.21, 0.0), DEFAULT_BOUNDS))
+        self.assertTrue(in_bounds((0.0, 0.21, 0.0), DEFAULT_BOUNDS))
+        self.assertFalse(in_bounds((0.0, 0.26, 0.0), DEFAULT_BOUNDS))
         self.assertFalse(in_bounds((0.0, 0.12, -0.1), DEFAULT_BOUNDS))
 
     def test_tracking_gate_reports_why_focus_is_silent(self):
@@ -95,7 +208,7 @@ class BoundsTests(unittest.TestCase):
                                        DEFAULT_BOUNDS), "invalid_position")
         self.assertEqual(tracking_gate(uv, point, np.array([0.09, 0.12, 0]),
                                        DEFAULT_BOUNDS), "outside_x")
-        self.assertEqual(tracking_gate(uv, point, np.array([0, 0.21, 0]),
+        self.assertEqual(tracking_gate(uv, point, np.array([0, 0.26, 0]),
                                        DEFAULT_BOUNDS), "outside_y")
         self.assertEqual(tracking_gate(uv, point, np.array([0, 0.12, 0.09]),
                                        DEFAULT_BOUNDS), "outside_z")
@@ -103,6 +216,40 @@ class BoundsTests(unittest.TestCase):
 
 
 class HandTargetTests(unittest.TestCase):
+    def test_projected_focus_matches_rotated_camera_coordinates(self):
+        from hand_track import (display_to_sensor_uv, draw_tracking_focus,
+                                project_board_point)
+
+        cap = SimpleNamespace(width=1280, height=720, rotation="ccw",
+                              intrinsics=SimpleNamespace(fx=650, fy=650,
+                                                         ppx=640, ppy=360))
+        R = np.eye(3)
+        translation = np.array([0, 0, -0.3])
+        focus = np.array([0.03, 0.12, 0])
+        uv = project_board_point(focus, R, translation, cap)
+        np.testing.assert_allclose(uv, (620, 574), atol=1)
+        np.testing.assert_allclose(
+            display_to_sensor_uv(uv, cap.width, cap.height, cap.rotation),
+            (705, 620), atol=1)
+        display = np.zeros((1280, 720, 3), np.uint8)
+        draw_tracking_focus(display, focus, R, translation, cap)
+        self.assertGreater(display[574, 620, 0], 200)
+        self.assertGreater(display[574, 620, 2], 200)
+
+    def test_allowed_outline_uses_observed_fingertip_height(self):
+        from hand_track import draw_tracking_focus
+
+        cap = SimpleNamespace(width=640, height=480, rotation="none",
+                              intrinsics=SimpleNamespace(fx=500, fy=500,
+                                                         ppx=320, ppy=240))
+        observed = np.array([0.01, 0.14, -0.02])
+        display = np.zeros((480, 640, 3), np.uint8)
+        with patch("hand_track.project_board_point", return_value=(320, 240)) as project:
+            draw_tracking_focus(display, None, np.eye(3), np.zeros(3),
+                                cap, observed=observed, gate="inside")
+        allowed_points = [call.args[0] for call in project.call_args_list[4:8]]
+        self.assertEqual([point[1] for point in allowed_points], [0.14] * 4)
+
     def test_mask_and_selected_fingertip(self):
         points = np.full((21, 2), (50.0, 60.0))
         points[0] = (50, 85)
@@ -121,16 +268,72 @@ class HandTargetTests(unittest.TestCase):
         points[8] = (-5, 20)
         self.assertIsNone(HandObservation(points, mask).point("index_tip"))
 
-    def test_tracking_uses_tip_and_rejects_other_calibration(self):
+    def test_click_selects_visible_landmark_only(self):
+        from hand_track import choose_hand_target
+
+        points = np.full((21, 2), (-20.0, -20.0))
+        points[4] = (45, 40)
+        points[8] = (85, 40)
+        observation = HandObservation(points, np.zeros((100, 100), np.uint8))
+        self.assertEqual(choose_hand_target(observation, (47, 42)), "thumb_tip")
+        self.assertEqual(choose_hand_target(observation, (84, 41)), "index_tip")
+        self.assertIsNone(choose_hand_target(observation, (8, 88)))
+        self.assertIsNone(choose_hand_target(None, (45, 40)))
+
+    def test_preview_click_silences_old_focus_before_changing_target(self):
+        import cv2
+        from hand_track import RealSenseSource
+
+        frame = np.zeros((480, 640, 3), np.uint8)
+        cap = object.__new__(RealSenseSource)
+        cap.stream_name = "color"
+        cap.serial = "camera"
+        cap.read = lambda: (True, frame)
+        cap.release = lambda: None
+        cap.point_3d = lambda uv, mask: np.array([(uv[0] - 320) / 1000,
+                                                  0.12, 0.0])
+        points = np.full((21, 2), (320.0, 240.0))
+        points[8] = (340, 245)
+        points[12] = (360, 250)
+        obs = HandObservation(points, hand_mask_from_landmarks(points, frame.shape))
+        calib = {"version": 2, "mode": "realsense_3d", "R": np.eye(3).tolist(),
+                 "t": [0, 0, 0], "target": "index_tip", "rms_mm": 1,
+                 "max_mm": 2, "frame_size": [640, 480], "stream": "color"}
+        callback = None
+        frames = 0
+
+        def set_callback(_window, fn):
+            nonlocal callback
+            callback = fn
+
+        def key(_delay):
+            nonlocal frames
+            frames += 1
+            if frames == 1:
+                callback(cv2.EVENT_LBUTTONDOWN, 360, 250, 0, None)
+                return -1
+            return ord("q")
+
+        with patch("hand_track.open_source", return_value=(cap, "realsense")), \
+                patch("hand_track.PalmDetector") as detector, \
+                patch("hand_track.open_preview_window"), \
+                patch("cv2.setMouseCallback", side_effect=set_callback), \
+                patch("cv2.imshow"), patch("cv2.waitKey", side_effect=key), \
+                patch("cv2.destroyAllWindows"):
+            detector.return_value.detect.return_value = obs
+            stats = run_tracking(calib=calib, dry=True, realsense=True)
+        self.assertEqual(len(stats["positions"]), 2)
+        self.assertAlmostEqual(stats["positions"][0][1], 0.02)
+        self.assertAlmostEqual(stats["positions"][1][1], 0.04)
+        self.assertEqual(len(stats["off_times"]), 1)
+
+    def test_tracking_uses_tip_and_rejects_invalid_calibration(self):
         from unittest.mock import patch
         from hand_track import RealSenseSource
 
         calib = {"version": 2, "mode": "realsense_3d", "R": np.eye(3).tolist(),
                  "t": [0, 0, 0], "target": "index_tip", "rms_mm": 1, "max_mm": 2,
                  "frame_size": [640, 480], "stream": "color"}
-        with self.assertRaises(SystemExit):
-            run_tracking(calib={**calib, "target": "palm"}, dry=True,
-                         target="index_tip", realsense=True)
         with self.assertRaises(SystemExit):
             run_tracking(calib={"H": np.eye(3).tolist()}, dry=True,
                          realsense=True)
@@ -156,11 +359,131 @@ class HandTargetTests(unittest.TestCase):
                 patch("hand_track.PalmDetector") as detector, \
                 patch("hand_track.PalmFollower.feed", capture_feed), \
                 patch("cv2.namedWindow"), patch("cv2.resizeWindow"), \
-                patch("cv2.imshow"), patch("cv2.waitKey", return_value=ord("q")), \
+                patch("cv2.imshow"), patch("cv2.setMouseCallback"), \
+                patch("cv2.waitKey", return_value=ord("q")), \
                 patch("cv2.destroyAllWindows"):
             detector.return_value.detect.return_value = obs
             run_tracking(calib=calib, dry=True, target="index_tip", realsense=True)
         np.testing.assert_allclose(seen[0], (0.02, 0.13, 0.005), atol=1e-10)
+
+
+class PartialTipTests(unittest.TestCase):
+    @staticmethod
+    def scene(x=72, y=68):
+        import cv2
+
+        rng = np.random.default_rng(123)
+        frame = np.zeros((140, 160, 3), np.uint8)
+        patch = rng.integers(60, 220, (25, 25), dtype=np.uint8)
+        frame[y-12:y+13, x-12:x+13] = cv2.cvtColor(patch, cv2.COLOR_GRAY2BGR)
+        depth = np.full((140, 160), 0.27, np.float32)
+        depth[y-13:y+14, x-13:x+14] = 0.14
+        return frame, depth
+
+    def test_clicked_partial_tip_tracks_without_hand_landmarks(self):
+        from hand_track import PartialTipTracker
+
+        tracker = PartialTipTracker()
+        first, first_depth = self.scene()
+        moved, moved_depth = self.scene(78, 71)
+        self.assertTrue(tracker.seed(first, first_depth, (72, 68), now=1.0))
+        self.assertEqual(tracker.update(moved, moved_depth, now=1.03), (78.0, 71.0))
+
+    def test_partial_tip_rejects_background_and_depth_jump(self):
+        from hand_track import PartialTipTracker
+
+        tracker = PartialTipTracker()
+        frame, depth = self.scene()
+        self.assertFalse(tracker.seed(frame, np.full_like(depth, 0.14),
+                                      (72, 68), now=1.0))
+        self.assertTrue(tracker.seed(frame, depth, (72, 68), now=1.0))
+        jumped = depth.copy()
+        jumped[55:82, 59:86] = 0.20
+        self.assertIsNone(tracker.update(frame, jumped, now=1.03))
+        self.assertIsNone(tracker.update(frame, depth, now=1.06))
+
+    def test_partial_tip_times_out_without_recent_visual_confirmation(self):
+        from hand_track import PartialTipTracker
+
+        frame, depth = self.scene()
+        tracker = PartialTipTracker(max_gap=0.15)
+        self.assertTrue(tracker.seed(frame, depth, (72, 68), now=1.0))
+        self.assertIsNone(tracker.update(frame, depth, now=1.17))
+
+    def test_partial_tip_near_frame_edge(self):
+        from hand_track import PartialTipTracker
+
+        tracker = PartialTipTracker()
+        first, depth = self.scene(13, 68)
+        moved, moved_depth = self.scene(16, 69)
+        self.assertTrue(tracker.seed(first, depth, (13, 68), now=1.0))
+        self.assertEqual(tracker.update(moved, moved_depth, now=1.03),
+                         (16.0, 69.0))
+
+    def test_unknown_tip_cannot_be_enabled_in_experimental_mode(self):
+        from hand_track import run_tracking
+
+        with self.assertRaisesRegex(SystemExit, "--manual-tip"):
+            run_tracking(calib={}, dry=True, realsense=True,
+                         experimental=True, manual_tip_enabled=True)
+
+    def test_mediapipe_retries_with_padding_and_maps_back_to_sensor_frame(self):
+        import sys
+        from hand_track import PalmDetector
+
+        image = np.zeros((80, 100, 3), np.uint8)
+        calls = []
+        landmarks = [SimpleNamespace(x=(72 + 18) / 136,
+                                     y=(40 + 14) / 108) for _ in range(21)]
+
+        def process(frame):
+            calls.append(frame.shape)
+            return SimpleNamespace(multi_hand_landmarks=(
+                [SimpleNamespace(landmark=landmarks)] if len(calls) == 2 else None))
+
+        detector = object.__new__(PalmDetector)
+        detector._legacy = SimpleNamespace(process=process)
+        detector._landmarker = None
+        with patch.dict(sys.modules, {"mediapipe": SimpleNamespace()}):
+            observation = detector.detect(image)
+        self.assertEqual(calls, [(80, 100, 3), (108, 136, 3)])
+        np.testing.assert_allclose(observation.point("index_tip"), (72, 40))
+
+    def test_manual_click_requires_three_matching_frames_before_focus(self):
+        import cv2
+        from hand_track import RealSenseSource
+
+        frame, depth = self.scene()
+        cap = object.__new__(RealSenseSource)
+        cap.stream_name = "color"
+        cap.serial = "camera"
+        cap.depth_m = depth
+        cap.read = lambda: (True, frame)
+        cap.release = lambda: None
+        cap.point_3d = lambda uv, mask: np.array([0.0, 0.12, 0.0])
+        calib = {"version": 2, "mode": "realsense_3d",
+                 "R": np.eye(3).tolist(), "t": [0, 0, 0],
+                 "target": "index_tip", "rms_mm": 1, "max_mm": 2,
+                 "frame_size": [160, 140], "stream": "color"}
+        state = {"callback": None, "frames": 0}
+
+        def key(_delay):
+            state["frames"] += 1
+            if state["frames"] == 1:
+                state["callback"](cv2.EVENT_LBUTTONDOWN, 72, 68, 0, None)
+            return ord("q") if state["frames"] == 4 else -1
+
+        with patch("hand_track.open_source", return_value=(cap, "realsense")), \
+                patch("hand_track.PalmDetector") as detector, \
+                patch("hand_track.open_preview_window"), \
+                patch("cv2.setMouseCallback", side_effect=lambda _win, fn: state.update(callback=fn)), \
+                patch("cv2.imshow"), patch("cv2.waitKey", side_effect=key), \
+                patch("cv2.destroyAllWindows"):
+            detector.return_value.detect.return_value = None
+            stats = run_tracking(calib=calib, dry=True, realsense=True,
+                                 manual_tip_enabled=True)
+        self.assertEqual(stats["sent"], 1)
+        self.assertEqual(stats["gate_counts"]["inside"], 1)
 
 
 class PalmFollowerTests(unittest.TestCase):
@@ -200,7 +523,7 @@ class PalmFollowerTests(unittest.TestCase):
     def test_out_of_bounds_silences_immediately(self):
         follower, board = self.make_follower()
         follower.feed(0.0, (0.0, 0.12, 0.0))
-        follower.feed(1 / 30, (0.0, 0.22, 0.0))                  # 高度越界
+        follower.feed(1 / 30, (0.0, 0.27, 0.0))                  # 高度越界
         self.assertEqual(follower.stats["off_times"], [1 / 30]) # 立即静默,不等超时
         follower.feed(2 / 30, (0.01, 0.12, 0.0))                 # 回到界内即恢复
         self.assertGreater(follower.stats["sent"], 1)
@@ -224,12 +547,14 @@ class PalmFollowerTests(unittest.TestCase):
         board = RecorderBoard()
         follower = PalmFollower(board.send, deadband_m=0.005, lost_s=0.1)
         follower.feed(0.0, (0.0, 0.12, 0.0))
+        np.testing.assert_allclose(follower.focus_position(), (0.0, 0.12, 0.0))
         follower.feed(0.05, (0.001, 0.12, 0.0))
         follower.feed(0.20, None)
         follower.close(t=0.25)
         self.assertEqual(follower.stats["sent"], 1)
         self.assertAlmostEqual(follower.stats["active_s"], 0.20)
         self.assertEqual(len(follower.stats["off_times"]), 1)
+        self.assertIsNone(follower.focus_position())
 
     def test_out_of_bounds_before_first_focus_is_not_a_dropout(self):
         board = RecorderBoard()
@@ -291,6 +616,150 @@ class HomographyTests(unittest.TestCase):
 
 
 class ThreeDTests(unittest.TestCase):
+    def test_calibration_checks_adjacent_distance_and_direction(self):
+        from hand_track import calibration_neighbor_checks, calibration_targets
+
+        targets = calibration_targets(3, 0.06, 0.10, 0.05)
+        samples = [np.asarray(point) for point in targets]
+        samples[17] = None
+        checks = calibration_neighbor_checks(samples, targets, 17,
+                                             np.asarray(targets[17]))
+        self.assertEqual({check["axis"] for check in checks}, {"x", "y", "z"})
+        self.assertTrue(all(not check["warn"] for check in checks))
+        self.assertEqual({round(check["expected_mm"]) for check in checks}, {50, 60})
+
+        samples[13] = None
+        moved = samples[12] + np.array([0.042, 0.016, 0.012])
+        checks = calibration_neighbor_checks(samples, targets, 13, moved)
+        height = next(check for check in checks if check["axis"] == "y")
+        self.assertLess(abs(height["measured_mm"] - 50), 5)
+        self.assertGreater(height["angle_deg"], 20)
+        self.assertTrue(height["warn"])
+
+    def test_review_allows_redoing_final_point_before_saving(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from hand_track import calibrate, calibration_targets
+
+        targets = calibration_targets(3, 0.06, 0.10, 0.05)
+        frame = np.zeros((480, 640, 3), np.uint8)
+
+        class FakeCap:
+            serial = "test-camera"
+            rotation = "ccw"
+            depth_m = np.full((480, 640), 0.20, np.float32)
+            index = 0
+            frames_at_point = 0
+            redone = False
+            enter_tried = False
+
+            def read(self):
+                self.frames_at_point += 1
+                return True, frame
+
+            def point_3d(self, uv, mask):
+                point = np.asarray(targets[self.index], float)
+                return point + ([0.08, 0, 0] if self.index == 17 and not self.redone
+                                else [0, 0, 0])
+
+            def release(self):
+                pass
+
+        cap = FakeCap()
+        keys = []
+
+        def key(_delay):
+            if cap.index == len(targets):
+                if not cap.redone:
+                    if not cap.enter_tried:
+                        cap.enter_tried = True
+                        keys.append("enter_invalid")
+                        return 13
+                    cap.redone = True
+                    cap.index = 17
+                    cap.frames_at_point = 0
+                    keys.append("r")
+                    return ord("r")
+                keys.append("q_valid")
+                return ord("q")
+            if cap.frames_at_point >= 8:
+                cap.index += 1
+                cap.frames_at_point = 0
+                return ord(" ")
+            return -1
+
+        observation = SimpleNamespace(point=lambda target: (320.0, 240.0),
+                                      mask=np.ones((480, 640), np.uint8))
+        with tempfile.TemporaryDirectory() as folder, \
+                patch("hand_track.open_source", return_value=(cap, "realsense")), \
+                patch("hand_track.PalmDetector") as detector, \
+                patch("hand_track.draw_hand_observation", return_value=frame.copy()), \
+                patch("hand_track.open_preview_window"), \
+                patch("cv2.imshow"), patch("cv2.waitKey", side_effect=key), \
+                patch("cv2.destroyAllWindows"), redirect_stdout(io.StringIO()):
+            detector.return_value.detect.return_value = observation
+            saved = calibrate(save=Path(folder) / "calib.json", realsense=True)
+        self.assertEqual(keys, ["enter_invalid", "r", "q_valid"])
+        self.assertLess(saved["max_mm"], 1e-6)
+        self.assertEqual(saved["rotation"], "ccw")
+
+    def test_rotated_fingertip_maps_back_to_sensor_depth(self):
+        from types import SimpleNamespace
+        from hand_track import (RealSenseSource, display_to_sensor_uv,
+                                rotate_image)
+
+        width, height = 20, 16
+        raw = np.full((height, width), 0.2, np.float32)
+        raw[5:14, 3:12] = 0.13
+        sensor_uv = (7, 9)
+        for rotation, display_uv in (("none", (7, 9)), ("ccw", (9, 12)),
+                                     ("cw", (6, 7)), ("180", (12, 6))):
+            with self.subTest(rotation=rotation):
+                source = object.__new__(RealSenseSource)
+                source.depth_enabled = True
+                source.depth_m = rotate_image(raw, rotation)
+                source.intrinsics = object()
+                source.width, source.height = width, height
+                source.rotation = rotation
+                source._rs = SimpleNamespace(rs2_deproject_pixel_to_point=
+                    lambda intrinsics, uv, depth: [*uv, depth])
+                self.assertEqual(
+                    display_to_sensor_uv(display_uv, width, height, rotation),
+                    sensor_uv)
+                point = source.point_3d(display_uv)
+                np.testing.assert_allclose(point, [7, 9, 0.13], atol=1e-6)
+
+    def test_changed_camera_rotation_rejects_old_calibration(self):
+        from unittest.mock import patch
+        from hand_track import RealSenseSource
+
+        calib = {"version": 2, "mode": "realsense_3d", "target": "index_tip",
+                 "R": np.eye(3).tolist(), "t": [0, 0, 0],
+                 "rms_mm": 11, "max_mm": 25, "serial": "test-camera"}
+        fake_cap = object.__new__(RealSenseSource)
+        fake_cap.rotation = "ccw"
+        fake_cap.serial = "test-camera"
+        fake_cap.release = lambda: None
+        with patch("hand_track.open_source", return_value=(fake_cap, "realsense")), \
+                patch("cv2.destroyAllWindows"):
+            with self.assertRaisesRegex(RuntimeError, "重新标定"):
+                run_tracking(calib=calib, dry=True, realsense=True)
+
+    def test_formal_calibration_accepts_12mm_rms_and_30mm_max(self):
+        from hand_track import validate_calibration
+        calib = {"version": 2, "mode": "realsense_3d", "target": "index_tip",
+                 "R": np.eye(3).tolist(), "t": [0, 0, 0],
+                 "rms_mm": 12.0, "max_mm": 30.0}
+        validate_calibration(calib, "index_tip")
+        with self.assertRaises(SystemExit):
+            validate_calibration({**calib, "rms_mm": 12.01}, "index_tip")
+        with self.assertRaises(SystemExit):
+            validate_calibration({**calib, "max_mm": 30.01}, "index_tip")
+
     def test_diagnostic_requires_explicit_experimental_mode(self):
         from hand_track import (calibration_from_diagnostic, calibration_targets,
                                 validate_calibration)
@@ -386,6 +855,7 @@ class ThreeDTests(unittest.TestCase):
                 patch("hand_track.open_source", return_value=(fake_cap, "realsense")), \
                 patch("hand_track.PalmDetector") as detector, \
                 patch("hand_track.open_preview_window"), patch("cv2.imshow"), \
+                patch("cv2.setMouseCallback"), \
                 patch("cv2.waitKey", return_value=ord("q")), \
                 patch("cv2.destroyAllWindows"):
             detector.return_value.detect.return_value = SimpleNamespace(
@@ -453,7 +923,12 @@ class ThreeDTests(unittest.TestCase):
         self.assertIsNone(fingertip_depth(depth, (20, 20), mask))
         depth[16:25, 16:25] = 0.15
         depth[16:25, 16:20] = 0.4
-        self.assertIsNone(fingertip_depth(depth, (20, 20), mask))
+        self.assertAlmostEqual(fingertip_depth(depth, (20, 20), mask),
+                               0.15, places=5)
+        depth[18, 20] = 0.10
+        depth[20, 20] = 0.10
+        self.assertAlmostEqual(fingertip_depth(depth, (20, 20), mask),
+                               0.15, places=5)
         preview = depth_colormap(np.array([[0, 0.10, 0.30, 0.60]], np.float32))
         self.assertEqual(preview.shape, (1, 4, 3))
         np.testing.assert_array_equal(preview[0, 0], [0, 0, 0])
@@ -608,10 +1083,12 @@ class CameraSettingsTests(unittest.TestCase):
         from unittest.mock import patch
         import hand_track
         fake = object()
-        with patch.object(hand_track, "RealSenseSource", return_value=fake):
-            src, name = hand_track.open_source(0, {"backend": "realsense"})
+        with patch.object(hand_track, "RealSenseSource", return_value=fake) as source:
+            src, name = hand_track.open_source(0, {
+                "backend": "realsense", "rs_rotation": "ccw"})
             self.assertIs(src, fake)                 # JSON 里记录过则自动走 SDK
             self.assertEqual(name, "realsense")
+            source.assert_called_with(depth=False, rotation="ccw")
             src2, name2 = hand_track.open_source(0, {}, realsense=True)
             self.assertIs(src2, fake)
             self.assertEqual(name2, "realsense")

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import threading
@@ -23,12 +24,16 @@ from my_patterns import Board, Modulator, pattern_for_kind
 os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 
 CALIB_PATH = Path(__file__).resolve().parent / "results/hand_tracking/hand_track_calib_3d.json"
+BOARD_CALIB_PATH = CALIB_PATH.with_name("hand_track_board_calib.json")
 DIAGNOSTIC_PATH = CALIB_PATH.with_name(CALIB_PATH.stem + "_diagnostic.json")
 CAM_SETTINGS_PATH = Path(__file__).resolve().parent / "results/hand_tracking/hand_track_cam.json"
+ROTATIONS = ("none", "cw", "ccw", "180")
 N = my_patterns.N_EMITTERS
 OFF_PATTERN = np.full(N, np.nan)
-DEFAULT_BOUNDS = ((-0.08, 0.08), (0.07, 0.20), (-0.08, 0.08))
+DEFAULT_BOUNDS = ((-0.08, 0.08), (0.07, 0.25), (-0.08, 0.08))
 EXPERIMENTAL_BOUNDS = ((-0.03, 0.03), (0.09, 0.16), (-0.03, 0.03))
+FORMAL_RMS_LIMIT_MM = 12.0
+FORMAL_MAX_LIMIT_MM = 30.0
 
 
 # ======================================================================
@@ -111,6 +116,22 @@ def tracking_gate(uv, camera_point, pos, bounds):
 def outside_axes(pos, bounds):
     return [axis for value, (lo, hi), axis in zip(pos, bounds, "xyz")
             if value < lo or value > hi]
+
+
+def phase_diagnostic(pos, phases, previous_payload=None, kind="focus"):
+    """Describe the quantized ON frame after a successful emit call."""
+    payload = my_patterns.phase_payload(phases)
+    changed = ("first" if previous_payload is None else
+               str(sum(a != b for a, b in zip(payload, previous_payload))))
+    center = ""
+    if kind == "focus":
+        reference = my_patterns.phase_payload(
+            my_patterns.phases_focus((0.0, float(pos[1]), 0.0)))
+        center = f" vs_center={sum(a != b for a, b in zip(payload, reference))}/256"
+    digest = hashlib.sha256(payload).hexdigest()[:12]
+    line = (f"x={pos[0]:+.3f} y={pos[1]:.3f} z={pos[2]:+.3f}m "
+            f"changed={changed}/256{center} sha256={digest}")
+    return line, payload
 
 
 def experimental_bounds(span, height_min=0.09, height_max=0.16):
@@ -222,6 +243,29 @@ class PalmFollower:
             if not self._off:
                 self.emit(OFF_PATTERN.copy())
                 self._off = True
+            self.band.reset()
+
+    def pause(self, t):
+        """Silence the old focus before a target change."""
+        with self._lock:
+            self._go_off(t)
+
+    def focus_position(self):
+        with self._lock:
+            return None if self.band.last is None else self.band.last.copy()
+
+    def phase_snapshot(self):
+        """Copy the current ON pattern for diagnostics without changing control."""
+        with self._lock:
+            return (None if self._off or self._prev_phases is None else
+                    self._prev_phases.copy())
+
+    def command_snapshot(self):
+        """Read the commanded position and ON pattern from the same update."""
+        with self._lock:
+            if self._off or self.band.last is None or self._prev_phases is None:
+                return None
+            return self.band.last.copy(), self._prev_phases.copy()
 
 
 class LossSupervisor:
@@ -270,9 +314,19 @@ class LossSupervisor:
 MODEL_PATH = Path(__file__).resolve().parent / "assets/hand_landmarker.task"
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
              "hand_landmarker/float16/latest/hand_landmarker.task")
-TARGET_LANDMARKS = {"thumb_tip": 4, "index_tip": 8, "middle_tip": 12,
-                    "ring_tip": 16, "pinky_tip": 20}
+LANDMARK_NAMES = (
+    "wrist", "thumb_cmc", "thumb_mcp", "thumb_ip", "thumb_tip",
+    "index_mcp", "index_pip", "index_dip", "index_tip",
+    "middle_mcp", "middle_pip", "middle_dip", "middle_tip",
+    "ring_mcp", "ring_pip", "ring_dip", "ring_tip",
+    "pinky_mcp", "pinky_pip", "pinky_dip", "pinky_tip")
+TARGET_LANDMARKS = {name: index for index, name in enumerate(LANDMARK_NAMES)}
 TARGETS = ("palm", *TARGET_LANDMARKS)
+HAND_CONNECTIONS = ((0, 1), (1, 2), (2, 3), (3, 4),
+                    (0, 5), (5, 6), (6, 7), (7, 8),
+                    (5, 9), (9, 10), (10, 11), (11, 12),
+                    (9, 13), (13, 14), (14, 15), (15, 16),
+                    (13, 17), (17, 18), (18, 19), (19, 20), (0, 17))
 
 
 @dataclass
@@ -313,7 +367,20 @@ def hand_mask_from_landmarks(points, shape):
     return mask
 
 
-def draw_hand_observation(frame, observation, target):
+def choose_hand_target(observation, uv, max_distance=22):
+    """Return the closest visible landmark to a preview click."""
+    if observation is None:
+        return None
+    candidates = [(np.linalg.norm(np.asarray(point) - uv), name)
+                  for name in TARGETS
+                  if (point := observation.point(name)) is not None]
+    if not candidates:
+        return None
+    distance, name = min(candidates)
+    return name if distance <= max_distance else None
+
+
+def draw_hand_observation(frame, observation, target, selectable=False):
     """Overlay the approximate mask and selected target on a preview frame."""
     import cv2
     display = frame.copy()
@@ -323,10 +390,120 @@ def draw_hand_observation(frame, observation, target):
     tint[:, :] = (40, 170, 40)
     display[observation.mask > 0] = cv2.addWeighted(
         display, 0.7, tint, 0.3, 0)[observation.mask > 0]
+    if selectable:
+        points = observation.landmarks
+        h, w = frame.shape[:2]
+        for a, b in HAND_CONNECTIONS:
+            if (0 <= points[a, 0] < w and 0 <= points[a, 1] < h and
+                    0 <= points[b, 0] < w and 0 <= points[b, 1] < h):
+                cv2.line(display, tuple(np.rint(points[a]).astype(int)),
+                         tuple(np.rint(points[b]).astype(int)),
+                         (255, 170, 40), 1, cv2.LINE_AA)
+        for index, name in enumerate(LANDMARK_NAMES):
+            point = observation.point(name)
+            if point is None:
+                continue
+            px = tuple(np.rint(point).astype(int))
+            cv2.circle(display, px, 3, (255, 255, 255), -1, cv2.LINE_AA)
+            if index in (0, 4, 8, 12, 16, 20):
+                cv2.putText(display, str(index), (px[0] + 5, px[1] - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255),
+                            1, cv2.LINE_AA)
+        palm = observation.point("palm")
+        if palm is not None:
+            cv2.circle(display, tuple(np.rint(palm).astype(int)), 5,
+                       (255, 255, 0), 1, cv2.LINE_AA)
     point = observation.point(target)
     if point is not None:
         x, y = point
         cv2.circle(display, (int(round(x)), int(round(y))), 9, (0, 0, 255), 2)
+    return display
+
+
+def project_board_point(pos, R, translation, cap):
+    """Project an array-coordinate 3D point into the rotated color preview."""
+    intr = getattr(cap, "intrinsics", None)
+    if intr is None:
+        return None
+    camera = np.asarray(R, float).T @ (
+        np.asarray(pos, float) - np.asarray(translation, float))
+    if not np.isfinite(camera).all() or camera[2] <= 0.05:
+        return None
+    try:
+        sensor_uv = (cap._rs.rs2_project_point_to_pixel(intr, camera.tolist())
+                     if getattr(cap, "_rs", None) is not None else None)
+    except (RuntimeError, ValueError):
+        sensor_uv = None
+    if sensor_uv is None:
+        sensor_uv = (intr.fx * camera[0] / camera[2] + intr.ppx,
+                     intr.fy * camera[1] / camera[2] + intr.ppy)
+    if not np.isfinite(sensor_uv).all():
+        return None
+    return sensor_to_display_uv(sensor_uv, cap.width, cap.height,
+                                cap.rotation)
+
+
+def draw_tracking_focus(display, pos, R, translation, cap,
+                        bounds=DEFAULT_BOUNDS, observed=None, gate=None):
+    """Show the commanded focus, allowed area, and rejected observations."""
+    import cv2
+
+    if getattr(cap, "intrinsics", None) is None:
+        return display
+    x0, x1 = np.min(my_patterns.EMITTERS[:, 0]), np.max(my_patterns.EMITTERS[:, 0])
+    z0, z1 = np.min(my_patterns.EMITTERS[:, 2]), np.max(my_patterns.EMITTERS[:, 2])
+    outline = [project_board_point((x, 0, z), R, translation, cap)
+               for x, z in ((x0, z1), (x1, z1), (x1, z0), (x0, z0))]
+    if all(point is not None for point in outline):
+        cv2.polylines(display, [np.rint(outline).astype(np.int32)],
+                      True, (0, 190, 255), 2, cv2.LINE_AA)
+    xlo, xhi = bounds[0]
+    zlo, zhi = bounds[2]
+    plane_y = (float(observed[1]) if observed is not None
+               and np.isfinite(observed).all() else bounds[1][0])
+    allowed = [project_board_point((x, plane_y, z), R, translation, cap)
+               for x, z in ((xlo, zhi), (xhi, zhi), (xhi, zlo), (xlo, zlo))]
+    if all(point is not None for point in allowed):
+        cv2.polylines(display, [np.rint(allowed).astype(np.int32)],
+                      True, (0, 210, 0), 1, cv2.LINE_AA)
+        cv2.putText(display, f"XZ range at y={plane_y * 100:.0f}cm",
+                    (10, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                    (0, 210, 0), 1, cv2.LINE_AA)
+    if observed is not None and gate is not None and gate.startswith("outside_"):
+        rejected = project_board_point(observed, R, translation, cap)
+        if rejected is not None:
+            point = tuple(np.rint(rejected).astype(int))
+            cv2.drawMarker(display, point, (0, 0, 255),
+                           cv2.MARKER_TILTED_CROSS, 20, 2, cv2.LINE_AA)
+            cv2.putText(display, "OUT " + gate.removeprefix("outside_"),
+                        (max(5, point[0] + 12), max(20, point[1] - 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2,
+                        cv2.LINE_AA)
+    if pos is None:
+        return display
+    footprint = project_board_point((pos[0], 0, pos[2]), R, translation, cap)
+    focus = project_board_point(pos, R, translation, cap)
+    if footprint is None or focus is None:
+        return display
+    foot_px = tuple(np.rint(footprint).astype(int))
+    focus_px = tuple(np.rint(focus).astype(int))
+    cv2.line(display, foot_px, focus_px, (255, 180, 0), 2, cv2.LINE_AA)
+    cv2.drawMarker(display, foot_px, (255, 255, 0),
+                   cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
+    height, width = display.shape[:2]
+    board_label_x = max(5, min(foot_px[0] + 12, width - 80))
+    board_label_y = max(20, min(foot_px[1] + 5, height - 5))
+    cv2.putText(display, "BOARD", (board_label_x, board_label_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 0), 1,
+                cv2.LINE_AA)
+    cv2.circle(display, focus_px, 11, (255, 0, 255), 2, cv2.LINE_AA)
+    cv2.circle(display, focus_px, 3, (255, 0, 255), -1, cv2.LINE_AA)
+    label = f"FOCUS y={pos[1] * 100:.1f}cm"
+    label_width = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0][0]
+    label_x = max(5, min(focus_px[0] + 14, width - label_width - 5))
+    label_y = max(20, min(focus_px[1] - 12, height - 5))
+    cv2.putText(display, label, (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
     return display
 
 
@@ -352,7 +529,9 @@ class PalmDetector:
         if hasattr(mp, "solutions"):
             self._legacy = mp.solutions.hands.Hands(static_image_mode=False,
                                                     max_num_hands=num_hands,
-                                                    model_complexity=0)
+                                                     model_complexity=1,
+                                                     min_detection_confidence=0.4,
+                                                     min_tracking_confidence=0.4)
         else:
             if not MODEL_PATH.exists():
                 _download_model(MODEL_PATH)
@@ -360,29 +539,43 @@ class PalmDetector:
             from mediapipe.tasks.python import vision
             options = vision.HandLandmarkerOptions(
                 base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
-                num_hands=num_hands)
+                running_mode=vision.RunningMode.VIDEO, num_hands=num_hands,
+                min_hand_detection_confidence=0.4,
+                min_hand_presence_confidence=0.4,
+                min_tracking_confidence=0.4)
             self._landmarker = vision.HandLandmarker.create_from_options(options)
+            self._last_timestamp_ms = 0
 
     def detect(self, frame_bgr):
         import cv2
         import mediapipe as mp
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        if self._legacy is not None:
-            res = self._legacy.process(rgb)
-            if not res.multi_hand_landmarks:
-                return None
-            lm = res.multi_hand_landmarks[0].landmark
-        else:
-            res = self._landmarker.detect(mp.Image(
-                image_format=mp.ImageFormat.SRGB, data=rgb))
-            if not res.hand_landmarks:
-                return None
-            lm = res.hand_landmarks[0]
         h, w = frame_bgr.shape[:2]
-        points = np.array([(point.x * w, point.y * h) for point in lm], float)
-        if points.shape != (21, 2) or not np.isfinite(points).all():
-            return None
-        return HandObservation(points, hand_mask_from_landmarks(points, frame_bgr.shape))
+        # Padding moves a cropped hand away from the model's frame boundary.
+        pad_x, pad_y = int(w * 0.18), int(h * 0.18)
+        for image, left, top in ((rgb, 0, 0),
+                                 (cv2.copyMakeBorder(rgb, pad_y, pad_y,
+                                                     pad_x, pad_x,
+                                                     cv2.BORDER_CONSTANT),
+                                  pad_x, pad_y)):
+            if self._legacy is not None:
+                res = self._legacy.process(image)
+                lm = res.multi_hand_landmarks[0].landmark if res.multi_hand_landmarks else None
+            else:
+                timestamp_ms = max(int(time.monotonic() * 1000),
+                                   self._last_timestamp_ms + 1)
+                self._last_timestamp_ms = timestamp_ms
+                res = self._landmarker.detect_for_video(mp.Image(
+                    image_format=mp.ImageFormat.SRGB, data=image), timestamp_ms)
+                lm = res.hand_landmarks[0] if res.hand_landmarks else None
+            if lm is None:
+                continue
+            ih, iw = image.shape[:2]
+            points = np.array([(point.x * iw - left, point.y * ih - top)
+                               for point in lm], float)
+            if points.shape == (21, 2) and np.isfinite(points).all():
+                return HandObservation(points, hand_mask_from_landmarks(points, frame_bgr.shape))
+        return None
 
     def palm(self, frame_bgr):
         observation = self.detect(frame_bgr)
@@ -392,6 +585,126 @@ class PalmDetector:
         for obj in (self._legacy, self._landmarker):
             if obj is not None:
                 obj.close()
+
+
+class PartialTipTracker:
+    """Continue a visible fingertip after full-hand landmarks disappear.
+
+    A partial finger cannot be named reliably from one image. A click or a
+    previously detected landmark supplies its identity; image matching then
+    has to agree with a separate, nearer RealSense depth layer on every frame.
+    """
+
+    def __init__(self, radius=12, max_step=40, max_gap=0.15,
+                 max_lifetime=10.0):
+        self.radius = radius
+        self.max_step = max_step
+        self.max_gap = max_gap
+        self.max_lifetime = max_lifetime
+        self.template = None
+        self.uv = None
+        self.depth = None
+        self.last_time = None
+        self.seed_time = None
+
+    def clear(self):
+        self.template = self.uv = self.depth = self.last_time = self.seed_time = None
+
+    def _foreground_depth(self, depth_m, uv):
+        if depth_m is None:
+            return None
+        depth_m = np.asarray(depth_m)
+        h, w = depth_m.shape
+        u, v = np.rint(uv).astype(int)
+        if not (4 <= u < w - 4 and 4 <= v < h - 4):
+            return None
+        tip_depth = fingertip_depth(depth_m, (u, v))
+        if tip_depth is None:
+            return None
+        outer = 48
+        x0, x1 = max(0, u - outer), min(w, u + outer + 1)
+        y0, y1 = max(0, v - outer), min(h, v + outer + 1)
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        ring = (np.maximum(np.abs(xx - u), np.abs(yy - v)) >= 24)
+        values = depth_m[y0:y1, x0:x1][ring]
+        valid = values[np.isfinite(values) & (values >= 0.07) & (values <= 0.50)]
+        if len(valid) < 80 or np.count_nonzero(valid >= tip_depth + 0.015) < 0.15 * len(valid):
+            return None
+        return tip_depth
+
+    def seed(self, frame, depth_m, uv, now=None):
+        """Arm only when the chosen point has texture and foreground depth."""
+        import cv2
+
+        if now is None:
+            now = time.perf_counter()
+        depth = self._foreground_depth(depth_m, uv)
+        if depth is None:
+            self.clear()
+            return False
+        u, v = np.rint(uv).astype(int)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        r = self.radius
+        padded = cv2.copyMakeBorder(gray, r, r, r, r, cv2.BORDER_CONSTANT)
+        patch = padded[v:v+2*r+1, u:u+2*r+1]
+        if patch.shape != (2*r+1, 2*r+1) or patch.std() < 8:
+            self.clear()
+            return False
+        self.template = patch.astype(np.float32)
+        self.uv = (float(u), float(v))
+        self.depth = depth
+        self.last_time = now
+        self.seed_time = now
+        return True
+
+    def update(self, frame, depth_m, now=None):
+        """Return the matched tip, or stop tracking as soon as confidence fails."""
+        import cv2
+
+        if now is None:
+            now = time.perf_counter()
+        if (self.template is None or now - self.last_time > self.max_gap
+                or now - self.seed_time > self.max_lifetime):
+            self.clear()
+            return None
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        r = self.radius
+        padded = cv2.copyMakeBorder(gray, r, r, r, r, cv2.BORDER_CONSTANT)
+        u, v = map(int, self.uv)
+        x0, x1 = max(4, u-self.max_step), min(w-5, u+self.max_step)
+        y0, y1 = max(4, v-self.max_step), min(h-5, v+self.max_step)
+        search = padded[y0:y1+2*r+1, x0:x1+2*r+1].astype(np.float32)
+        if search.shape[0] < 2*r+1 or search.shape[1] < 2*r+1:
+            self.clear()
+            return None
+        scores = cv2.matchTemplate(search, self.template, cv2.TM_CCOEFF_NORMED)
+        candidates = []
+        for _ in range(5):
+            _, score, _, location = cv2.minMaxLoc(scores)
+            if score < 0.72:
+                break
+            candidate = (x0 + location[0], y0 + location[1])
+            candidate_depth = self._foreground_depth(depth_m, candidate)
+            if (candidate_depth is not None and
+                    abs(candidate_depth - self.depth) <= 0.025 and
+                    np.linalg.norm(np.asarray(candidate) - self.uv) <= self.max_step):
+                candidates.append((score, candidate, candidate_depth))
+            sx, sy = location
+            scores[max(0, sy-r):sy+r+1, max(0, sx-r):sx+r+1] = -1
+        if not candidates or (len(candidates) > 1 and
+                              candidates[0][0] - candidates[1][0] < 0.04):
+            self.clear()
+            return None
+        score, candidate, depth = candidates[0]
+        x, y = candidate
+        patch = padded[y:y+2*r+1, x:x+2*r+1].astype(np.float32)
+        if score >= 0.82:
+            self.template = 0.8 * self.template + 0.2 * patch
+        self.uv = (float(x), float(y))
+        self.depth = depth
+        self.last_time = now
+        return self.uv
 
 
 # ----------------------------------------------------------------------
@@ -504,12 +817,78 @@ def open_camera(cam, settings=None):
         "③Windows 设置→隐私和安全→相机→允许桌面应用访问;④加 --backend msmf 再试")
 
 
+def rotate_image(image, rotation):
+    turns = {"none": 0, "ccw": 1, "180": 2, "cw": 3}[rotation]
+    return np.ascontiguousarray(np.rot90(image, turns)) if turns else image
+
+
+def display_to_sensor_uv(uv, width, height, rotation):
+    """Map a rotated display pixel back to the aligned sensor frame."""
+    u, v = map(float, uv)
+    if rotation == "ccw":
+        return width - 1 - v, u
+    if rotation == "cw":
+        return v, height - 1 - u
+    if rotation == "180":
+        return width - 1 - u, height - 1 - v
+    return u, v
+
+
+def sensor_to_display_uv(uv, width, height, rotation):
+    """Map a raw sensor pixel into the rotated preview."""
+    u, v = map(float, uv)
+    if rotation == "ccw":
+        return v, width - 1 - u
+    if rotation == "cw":
+        return height - 1 - v, u
+    if rotation == "180":
+        return width - 1 - u, height - 1 - v
+    return u, v
+
+
+def grid_from_camera_corners(cap, corners):
+    """Interpolate clicked emitters after undoing the color lens distortion."""
+    from board_calibration import grid_from_corners
+
+    intr = getattr(cap, "intrinsics", None)
+    if intr is None:
+        raise ValueError("相机内参尚未就绪;请等待深度/彩色帧")
+
+    def pixel_to_ray(display_uv):
+        sensor_uv = display_to_sensor_uv(display_uv, cap.width, cap.height,
+                                         cap.rotation)
+        if getattr(cap, "_rs", None) is not None:
+            return cap._rs.rs2_deproject_pixel_to_point(
+                intr, list(sensor_uv), 1.0)[:2]
+        return ((sensor_uv[0] - intr.ppx) / intr.fx,
+                (sensor_uv[1] - intr.ppy) / intr.fy)
+
+    def ray_to_pixel(ray):
+        if getattr(cap, "_rs", None) is not None:
+            sensor_uv = cap._rs.rs2_project_point_to_pixel(
+                intr, [float(ray[0]), float(ray[1]), 1.0])
+        else:
+            sensor_uv = (intr.fx * ray[0] + intr.ppx,
+                         intr.fy * ray[1] + intr.ppy)
+        return sensor_to_display_uv(sensor_uv, cap.width, cap.height,
+                                    cap.rotation)
+
+    try:
+        return grid_from_corners(corners, pixel_to_ray, ray_to_pixel)
+    except RuntimeError as exc:
+        raise ValueError(f"相机镜头畸变换算失败: {exc}") from exc
+
+
 class RealSenseSource:
     """RealSense 帧源;depth=True 时将深度对齐到彩色帧。"""
 
-    def __init__(self, width=1280, height=720, fps=30, depth=False):
+    def __init__(self, width=1280, height=720, fps=30, depth=False,
+                 rotation="none"):
+        if rotation not in ROTATIONS:
+            raise ValueError(f"未知 RealSense 画面旋转: {rotation}")
         import pyrealsense2 as rs
         self._rs = rs
+        self.rotation = rotation
         devices = rs.context().query_devices()
         if len(devices) == 0:
             raise SystemExit("RealSense SDK 未发现设备，请检查连接与设备管理器")
@@ -520,6 +899,7 @@ class RealSenseSource:
             p.stream_type() == rs.stream.color for p in profiles) else "infrared"
         self.depth_enabled = depth
         self.depth_m = None
+        self._depth_m_raw = None
         self.intrinsics = None
         self._depth_frame = None
         self._color_bgr = None
@@ -605,14 +985,17 @@ class RealSenseSource:
                 color_frame = frames.get_color_frame()
                 if not depth_frame or not color_frame:
                     self.depth_m = None
+                    self._depth_m_raw = None
                     self._depth_frame = None
                     continue
                 depth_data = np.asanyarray(depth_frame.get_data())
                 if depth_data.shape != (color_frame.get_height(), color_frame.get_width()):
                     self.depth_m = None
+                    self._depth_m_raw = None
                     self._depth_frame = None
                     continue
-                self.depth_m = depth_data.astype(np.float32) * self._depth_scale
+                self._depth_m_raw = depth_data.astype(np.float32) * self._depth_scale
+                self.depth_m = rotate_image(self._depth_m_raw, self.rotation)
                 self._depth_frame = depth_frame
                 self.intrinsics = color_frame.profile.as_video_stream_profile().intrinsics
             frame = self._frame(frames) if frames else None
@@ -623,7 +1006,7 @@ class RealSenseSource:
                     image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
                 if self.depth_enabled:
                     self._color_bgr = image
-                return True, image
+                return True, rotate_image(image, self.rotation)
         return False, None
 
     def isOpened(self):
@@ -642,25 +1025,28 @@ class RealSenseSource:
         depth = fingertip_depth(self.depth_m, uv, mask)
         if depth is None:
             return None
+        sensor_uv = display_to_sensor_uv(uv, self.width, self.height,
+                                         self.rotation)
         return np.asarray(self._rs.rs2_deproject_pixel_to_point(
-            self.intrinsics, list(map(float, uv)), depth), float)
+            self.intrinsics, list(sensor_uv), depth), float)
 
     def point_cloud(self, uv=None):
         """Downsample the aligned SDK point cloud, retaining detail near the target."""
         if self._depth_frame is None or self._color_bgr is None:
             return np.empty((0, 3)), np.empty((0, 3))
-        h, w = self.depth_m.shape
+        h, w = self._depth_m_raw.shape
         points = self._pointcloud.calculate(self._depth_frame)
         vertices = np.asanyarray(points.get_vertices()).view(np.float32).reshape(h, w, 3)
         sample = np.zeros((h, w), bool)
         sample[::12, ::12] = True
         if uv is not None:
-            u, v = map(int, np.rint(uv))
+            u, v = map(int, np.rint(display_to_sensor_uv(
+                uv, w, h, self.rotation)))
             x0, x1 = max(0, u - 100), min(w, u + 101)
             y0, y1 = max(0, v - 100), min(h, v + 101)
             sample[y0:y1:3, x0:x1:3] = True
         valid = sample & np.isfinite(vertices).all(axis=2)
-        valid &= (self.depth_m >= 0.07) & (self.depth_m <= 0.50)
+        valid &= (self._depth_m_raw >= 0.07) & (self._depth_m_raw <= 0.50)
         return vertices[valid], self._color_bgr[valid, ::-1] / 255.0
 
     def _sensor(self):
@@ -700,7 +1086,8 @@ def open_source(cam, settings=None, realsense=False, depth=False):
     则走 SDK 彩色/红外流,其余走 cv2 后端链。返回 (帧源, 名字)。"""
     settings = dict(settings or {})
     if realsense or settings.get("backend") == "realsense":
-        source = RealSenseSource(depth=True) if depth else RealSenseSource()
+        source = RealSenseSource(depth=depth,
+                                 rotation=settings.get("rs_rotation", "none"))
         if settings.get("rs_auto_exposure") is not None:
             source.set_auto_exposure(bool(settings["rs_auto_exposure"]))
         if settings.get("rs_auto_exposure") is False and settings.get("rs_exposure_us") is not None:
@@ -792,7 +1179,7 @@ class PointCloudPreview:
 
 
 def camtest(cam=0, settings_path=CAM_SETTINGS_PATH, backend=None, realsense=False,
-            target="index_tip", depth=False, pointcloud=False):
+            target="index_tip", depth=False, pointcloud=False, rotation=None):
     """摄像头诊断/整定:实时窗口用键盘调参,ESC 退出并保存 hand_track_cam.json。
     W/S 曝光±  A/D 亮度±  Q/E 增益±  -/= 变焦±  X 自动曝光开关
     R 循环分辨率(640x480→1280x720→1920x1080)  P 打印当前参数
@@ -804,6 +1191,8 @@ def camtest(cam=0, settings_path=CAM_SETTINGS_PATH, backend=None, realsense=Fals
     settings = load_cam_settings(settings_path)
     if backend:
         settings["backend"] = backend
+    if rotation is not None:
+        settings["rs_rotation"] = rotation
     if (depth or pointcloud) and not (realsense or settings.get("backend") == "realsense"):
         raise SystemExit("深度图/三维点云需要 --realsense 和 RealSense 深度相机")
     overrides = {k: v for k, v in settings.items() if k != "backend" and v is not None}
@@ -948,6 +1337,7 @@ def camtest(cam=0, settings_path=CAM_SETTINGS_PATH, backend=None, realsense=Fals
             print(f"  hand_track_cam.json 内容: {json.dumps(overrides)}")
     save = {"backend": used_backend}
     if used_backend == "realsense":
+        save["rs_rotation"] = cap.rotation
         save["rs_auto_exposure"] = cap.get_auto_exposure()
         if save["rs_auto_exposure"] is False:
             save["rs_exposure_us"] = cap.get_exposure()
@@ -962,7 +1352,7 @@ def camtest(cam=0, settings_path=CAM_SETTINGS_PATH, backend=None, realsense=Fals
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(save, indent=1), encoding="utf-8")
     print(f"摄像头设置已保存: {settings_path}")
-    print("注意:分辨率/变焦改变会使既有单应标定失效,改完设置请重跑 calibrate")
+    print("注意:相机位置或画面方向改变后，请重新运行 calibrate；旧三维标定不再适用")
     return save
 
 
@@ -973,7 +1363,7 @@ def pixel_to_world(H, uv):
 
 
 def fingertip_depth(depth_m, uv, mask=None, radius=4):
-    """取目标点周围前景深度中位数;拒绝孔洞和深度不连续边界。"""
+    """Select the nearest supported depth layer inside the fingertip mask."""
     h, w = depth_m.shape
     u, v = np.rint(uv).astype(int)
     if not (radius <= u < w - radius and radius <= v < h - radius):
@@ -985,11 +1375,24 @@ def fingertip_depth(depth_m, uv, mask=None, radius=4):
     values = patch[good]
     if len(values) < 12:
         return None
-    median = float(np.median(values))
-    near = values[np.abs(values - median) <= 0.012]
-    if len(near) < max(12, len(values) * 0.65):
-        return None
-    return float(np.median(near))
+    ordered = np.sort(values)
+    required = max(12, int(np.ceil(len(values) * 0.25)))
+    center = patch[max(0, radius - 2):radius + 3,
+                   max(0, radius - 2):radius + 3]
+    center_good = good[max(0, radius - 2):radius + 3,
+                       max(0, radius - 2):radius + 3]
+    center_values = center[center_good]
+    for start in range(len(ordered) - required + 1):
+        if ordered[start + required - 1] - ordered[start] > 0.012:
+            continue
+        layer = ordered[(ordered >= ordered[start])
+                        & (ordered <= ordered[start] + 0.012)]
+        result = float(np.median(layer))
+        if len(center_values) >= 3 and np.count_nonzero(
+                np.abs(center_values - result) <= 0.012) < 3:
+            continue
+        return result
+    return None
 
 
 def fit_rigid_transform(camera_points, world_points):
@@ -1014,7 +1417,7 @@ def fit_rigid_transform(camera_points, world_points):
     return R, t, errors
 
 
-def calibration_from_diagnostic(diagnostic):
+def calibration_from_diagnostic(diagnostic, allow_high_error=False):
     """Recheck a rejected sample set for a tightly limited hardware experiment."""
     try:
         camera = np.asarray(diagnostic["points"]["camera"], float)
@@ -1026,28 +1429,57 @@ def calibration_from_diagnostic(diagnostic):
         frame_size = list(diagnostic["frame_size"])
     except (KeyError, TypeError, ValueError) as exc:
         raise SystemExit(f"实验诊断文件不完整: {exc}") from exc
+    rms_limit = 20.0 if allow_high_error else 15.0
+    max_limit = 40.0 if allow_high_error else 30.0
     if (camera.shape != (18, 3) or len(serial) < 3 or len(frame_size) != 2
-            or rms_mm > 15 or max_mm > 30):
+            or rms_mm > rms_limit or max_mm > max_limit):
         raise SystemExit(f"诊断数据不符合实验限制(RMS {rms_mm:.1f}mm,最大 {max_mm:.1f}mm)")
     return {"version": 2, "mode": "realsense_3d_experimental",
             "R": R.tolist(), "t": t.tolist(), "rms_mm": rms_mm, "max_mm": max_mm,
             "target": "index_tip", "frame_size": frame_size, "stream": "color",
-            "serial": serial}
+            "serial": serial, "rotation": diagnostic.get("rotation", "none"),
+            "provisional_high_error": bool(allow_high_error)}
 
 
-def validate_calibration(calib, target, experimental=False):
-    expected_mode = "realsense_3d_experimental" if experimental else "realsense_3d"
-    if calib.get("version") != 2 or calib.get("mode") != expected_mode:
+def validate_calibration(calib, target, experimental=False, allow_high_error=False):
+    expected_modes = (("realsense_3d_experimental",) if experimental else
+                      ("realsense_3d", "realsense_board_3d"))
+    if calib.get("version") != 2 or calib.get("mode") not in expected_modes:
         raise SystemExit("旧二维标定不能用于高度跟踪;请运行 calibrate --realsense 重新标定")
-    if calib.get("target") != target:
+    if experimental and calib.get("target") != target:
         raise SystemExit(f"标定目标是 {calib.get('target')};请用 --target {target} 重新标定")
     R = np.asarray(calib.get("R"), float)
     t = np.asarray(calib.get("t"), float)
+    board_mode = calib["mode"] == "realsense_board_3d"
+    if board_mode:
+        from board_calibration import ORIENTATIONS
+        orientation_valid = calib.get("orientation") in ORIENTATIONS
+    else:
+        orientation_valid = True
+    rms_limit = 20 if experimental and allow_high_error else (
+        15 if experimental else FORMAL_RMS_LIMIT_MM)
+    max_limit = 40 if experimental and allow_high_error else (
+        30 if experimental else FORMAL_MAX_LIMIT_MM)
+    depth_board = board_mode and calib.get("board_pose_method") in (
+        "depth", "depth_corners")
+    manual_board = board_mode and calib.get("board_pose_method") == "depth_corners"
+    corners = np.asarray(calib.get("board_corners_px", []), float)
     if (R.shape != (3, 3) or t.shape != (3,) or not np.isfinite(R).all()
             or not np.isfinite(t).all() or not np.allclose(R.T @ R, np.eye(3), atol=1e-3)
             or abs(abs(np.linalg.det(R)) - 1) > 1e-3
-            or float(calib.get("rms_mm", np.inf)) > (15 if experimental else 10)
-            or float(calib.get("max_mm", np.inf)) > (30 if experimental else 20)):
+            or (not board_mode and (float(calib.get("rms_mm", np.inf)) > rms_limit
+                                    or float(calib.get("max_mm", np.inf)) > max_limit))
+            or (board_mode and (not orientation_valid
+                                or (manual_board and (corners.shape != (4, 2)
+                                                      or not np.isfinite(corners).all()))
+                                or calib.get("board_matched", 0) < 145
+                                or float(calib.get("board_grid_rms_px", np.inf)) > 5.0
+                                or (depth_board and (
+                                    calib.get("board_inliers", 0) < 50
+                                    or float(calib.get("board_depth_rms_mm", np.inf)) > 8.5))
+                                or (not depth_board and (
+                                    calib.get("board_inliers", 0) < 100
+                                    or float(calib.get("board_pose_rms_px", np.inf)) > 7.0))))):
         raise SystemExit("三维标定无效或残差过大;请重新标定")
     return R, t
 
@@ -1056,6 +1488,300 @@ def calibration_targets(grid, span, dist, height_step):
     axes = np.linspace(-span, span, grid)
     return [(float(x), float(y), float(z))
             for z in axes for x in axes for y in (dist, dist + height_step)]
+
+
+def calibration_neighbor_checks(samples, targets, index, point):
+    """Compare a candidate against adjacent samples and earlier axis directions."""
+    world = np.asarray(targets, float)
+    candidate = np.asarray(point, float)
+    checks = []
+    for axis in range(3):
+        other = [i for i in range(3) if i != axis]
+        neighbors = [(abs(world[index, axis] - world[j, axis]), j)
+                     for j, sample in enumerate(samples) if j != index and sample is not None
+                     and np.allclose(world[index, other], world[j, other], atol=1e-9)
+                     and not np.isclose(world[index, axis], world[j, axis])]
+        if not neighbors:
+            continue
+        expected, neighbor = min(neighbors)
+        sign = np.sign(world[index, axis] - world[neighbor, axis])
+        move = sign * (candidate - samples[neighbor])
+        measured = float(np.linalg.norm(move))
+        references = []
+        for a in range(len(samples)):
+            if a == index or samples[a] is None:
+                continue
+            for b in range(a + 1, len(samples)):
+                if b == index or samples[b] is None:
+                    continue
+                if (np.allclose(world[a, other], world[b, other], atol=1e-9)
+                        and np.isclose(abs(world[b, axis] - world[a, axis]), expected)):
+                    vector = np.sign(world[b, axis] - world[a, axis]) * (samples[b] - samples[a])
+                    length = np.linalg.norm(vector)
+                    if length > 1e-6:
+                        references.append(vector / length)
+        angle = None
+        if measured > 1e-6 and references:
+            direction = np.median(references, axis=0)
+            direction_length = np.linalg.norm(direction)
+            if direction_length > 1e-6:
+                direction /= direction_length
+                angle = float(np.degrees(np.arccos(np.clip(
+                    np.dot(move / measured, direction), -1.0, 1.0))))
+        checks.append({"axis": "xyz"[axis], "neighbor": neighbor,
+                       "expected_mm": expected * 1000, "measured_mm": measured * 1000,
+                       "angle_deg": angle,
+                       "warn": abs(measured - expected) > 0.005
+                       or (angle is not None and angle > 20.0)})
+    return checks
+
+
+def calibration_check_text(check):
+    direction = (f" dir={check['angle_deg']:.0f}deg"
+                 if check["angle_deg"] is not None else "")
+    status = " CHECK" if check["warn"] else " OK"
+    return (f"{check['axis'].upper()} #{check['neighbor'] + 1}: "
+            f"{check['measured_mm']:.1f}/{check['expected_mm']:.1f}mm"
+            f"{direction}{status}")
+
+
+def board_pose_from_frame(cap, frame, orientation, grid=None, manual_corners=False):
+    from board_calibration import (detect_board_grid, estimate_board_pose,
+                                   estimate_board_pose_from_depth)
+
+    if grid is None:
+        grid = detect_board_grid(frame)
+    depth_error = None
+    depth_pose = None
+    if getattr(cap, "depth_m", None) is not None:
+        measured = np.full((len(grid.pixels), 3), np.nan)
+        for index in np.flatnonzero(grid.matched):
+            point = cap.point_3d(grid.observed[index])
+            if point is not None:
+                measured[index] = point
+        try:
+            depth_pose = estimate_board_pose_from_depth(grid, measured, orientation)
+        except ValueError as exc:
+            depth_error = str(exc)
+    if depth_pose is not None:
+        R, t, depth_rms_mm, inliers, valid_depth = depth_pose
+        quality = {"board_pose_method": "depth_corners" if manual_corners else "depth",
+                   "board_inliers": inliers,
+                   "board_depth_valid": valid_depth,
+                   "board_depth_rms_mm": depth_rms_mm}
+    else:
+        if manual_corners:
+            raise ValueError(f"四角深度定位失败: {depth_error or '没有对齐深度图'}")
+        to_sensor = lambda uv: display_to_sensor_uv(uv, cap.width, cap.height,
+                                                     cap.rotation)
+        try:
+            R, t, pose_rms_px, inliers = estimate_board_pose(
+                grid, cap.intrinsics, to_sensor, orientation)
+        except ValueError as exc:
+            if depth_error is not None:
+                raise ValueError(f"深度定位: {depth_error};彩色定位: {exc}") from exc
+            raise
+        quality = {"board_pose_method": "color", "board_inliers": inliers,
+                   "board_pose_rms_px": pose_rms_px}
+    data = {"version": 2, "mode": "realsense_board_3d", "R": R.tolist(),
+            "t": t.tolist(), "target": "index_tip", "orientation": orientation,
+            "board_matched": int(grid.matched.sum()),
+            "board_grid_rms_px": grid.rms_px, **quality,
+            "frame_size": [frame.shape[1], frame.shape[0]], "stream": "color",
+            "serial": cap.serial, "rotation": cap.rotation}
+    if manual_corners:
+        data["board_corners_px"] = grid.corners.tolist()
+        data["board_grid_model"] = grid.model
+    try:
+        validate_calibration(data, "index_tip")
+    except SystemExit as exc:
+        raise ValueError(str(exc)) from exc
+    return data, grid
+
+
+def board_poses_agree(first, second, position_m=0.015, angle_deg=5.0):
+    """Require adjacent frames to locate the same stationary array."""
+    if (first is None or first.get("orientation") != second.get("orientation")
+            or first.get("board_pose_method") != second.get("board_pose_method")):
+        return False
+    R1, R2 = np.asarray(first["R"], float), np.asarray(second["R"], float)
+    t1, t2 = np.asarray(first["t"], float), np.asarray(second["t"], float)
+    if np.linalg.norm(t1 - t2) > position_m:
+        return False
+    cosine = np.clip((np.trace(R1 @ R2.T) - 1) / 2, -1, 1)
+    return np.degrees(np.arccos(cosine)) <= angle_deg
+
+
+def draw_board_pose(frame, grid, orientation, data):
+    import cv2
+    from board_calibration import board_object_points
+
+    display = frame.copy()
+    corners = np.rint(grid.corners).astype(np.int32)
+    cv2.polylines(display, [corners], True, (0, 220, 0), 2)
+    for index in range(0, len(grid.pixels), 4):
+        if grid.matched[index]:
+            cv2.circle(display, tuple(np.rint(grid.pixels[index]).astype(int)),
+                       2, (0, 220, 0), -1)
+    objects = board_object_points(orientation)
+    origin = tuple(np.rint(grid.pixels[[119, 120, 135, 136]].mean(axis=0)).astype(int))
+    for axis, target, color in (("+X", (0.0525, 0), (0, 220, 255)),
+                                ("+Z", (0, 0.0525), (255, 80, 180))):
+        i = np.argmin(np.linalg.norm(objects[:, (0, 2)] - target, axis=1))
+        end = tuple(np.rint(grid.pixels[i]).astype(int))
+        cv2.arrowedLine(display, origin, end, color, 3, tipLength=0.2)
+        cv2.putText(display, axis, end, cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, color, 2, cv2.LINE_AA)
+    pose_text = (f"{data['board_pose_method']} {data['board_inliers']}/"
+                 f"{data['board_depth_valid']} "
+                 f"{data['board_depth_rms_mm']:.1f}mm"
+                 if data.get("board_pose_method") in ("depth", "depth_corners") else
+                 f"color {data['board_inliers']} inliers  "
+                 f"{data['board_pose_rms_px']:.1f}px")
+    grid_text = ("four corners + aligned depth" if data.get("board_pose_method") == "depth_corners"
+                 else f"grid {data['board_matched']}/256  {data['board_grid_rms_px']:.1f}px")
+    lines = (f"X/Z: {orientation}  (+Y out of board)",
+             grid_text,
+             pose_text,
+             "A/D axes  C confirm  S snapshot  Q cancel")
+    for row, line in enumerate(lines):
+        cv2.putText(display, line, (10, 28 + row * 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2,
+                    cv2.LINE_AA)
+    return display
+
+
+def save_board_diagnostic(cap, frame, path=None):
+    """Capture aligned color/depth and sensor intrinsics for offline diagnosis."""
+    path = Path(path or CALIB_PATH.with_name("board_depth_diagnostic.npz"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    intr = cap.intrinsics
+    np.savez_compressed(
+        path, color_bgr=frame,
+        depth_m=(cap.depth_m if cap.depth_m is not None else np.empty((0, 0))),
+        intrinsics=np.array([intr.fx, intr.fy, intr.ppx, intr.ppy]),
+        distortion=np.asarray(intr.coeffs), distortion_model=str(intr.model),
+        rotation=cap.rotation,
+        serial=cap.serial)
+    return path
+
+
+def boardcalibrate(save=BOARD_CALIB_PATH, manual_corners=False):
+    """Automatically fit array geometry; require one explicit axis confirmation."""
+    import cv2
+    from board_calibration import ORIENTATIONS
+
+    cap, _ = open_source(0, load_cam_settings(), realsense=True, depth=True)
+    window_name = "board calibration (A/D axes C confirm Q cancel)"
+    window_open = False
+    orientation_index = 0
+    if manual_corners:
+        print("请移开阵列上方的手;点完四角后按 A/D 选择真实 +X/+Z 方向")
+    else:
+        print("请移开阵列上方的手;圆孔网格识别后按 A/D 选择真实 +X/+Z 方向")
+    print("对称方阵不能自行判断硬件正轴;看清箭头后按 C 确认,按 Q 取消")
+    last_error = None
+    previous_pose = None
+    stable_frames = 0
+    clicks = []
+    last_corners = None
+    last_error_print = 0.0
+
+    def on_mouse(event, x, y, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(clicks) < 4:
+            clicks.append((x, y))
+        elif event == cv2.EVENT_RBUTTONDOWN and clicks:
+            clicks.pop()
+
+    if manual_corners:
+        print("依次左键点击最外侧阵元中心:左上、右上、右下、左下;右键撤销最后一点")
+    try:
+        while True:
+            ok, frame = read_frame(cap, timeout_s=0.3)
+            if not ok:
+                continue
+            corner_signature = tuple(clicks)
+            if manual_corners and corner_signature != last_corners:
+                previous_pose = None
+                stable_frames = 0
+                last_corners = corner_signature
+            if manual_corners and len(clicks) < 4:
+                data = None
+                display = frame.copy()
+                cv2.putText(display, f"Click outer emitter centers: TL TR BR BL ({len(clicks)}/4)",
+                            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                            (0, 255, 255), 1, cv2.LINE_AA)
+            else:
+                try:
+                    if manual_corners:
+                        grid = grid_from_camera_corners(cap, clicks)
+                        data, grid = board_pose_from_frame(
+                            cap, frame, ORIENTATIONS[orientation_index],
+                            grid=grid, manual_corners=True)
+                    else:
+                        data, grid = board_pose_from_frame(
+                            cap, frame, ORIENTATIONS[orientation_index])
+                    display = draw_board_pose(frame, grid,
+                                              ORIENTATIONS[orientation_index], data)
+                    stable_frames = stable_frames + 1 if board_poses_agree(
+                        previous_pose, data) else 1
+                    previous_pose = data
+                    cv2.putText(display, f"pose stable {min(stable_frames, 2)}/2",
+                                (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                                (0, 255, 255), 2, cv2.LINE_AA)
+                    last_error = None
+                except ValueError as exc:
+                    data = None
+                    previous_pose = None
+                    stable_frames = 0
+                    display = frame.copy()
+                    now = time.perf_counter()
+                    if str(exc) != last_error and now - last_error_print >= 2.0:
+                        print(f"  阵列识别中: {exc}")
+                        last_error_print = now
+                    last_error = str(exc)
+                    cv2.putText(display, "Board pose unavailable", (10, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1,
+                                cv2.LINE_AA)
+            if manual_corners:
+                for index, (x, y) in enumerate(clicks):
+                    cv2.circle(display, (x, y), 5, (0, 255, 255), -1)
+                    cv2.putText(display, str(index + 1), (x + 8, y - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255),
+                                2, cv2.LINE_AA)
+            if not window_open:
+                open_preview_window(window_name, display)
+                if manual_corners:
+                    cv2.setMouseCallback(window_name, on_mouse)
+                window_open = True
+            cv2.imshow(window_name, display)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                raise SystemExit("未保存阵列自动标定")
+            if key == ord("s"):
+                print(f"彩色与对齐深度诊断已保存: {save_board_diagnostic(cap, frame)}")
+            if key == ord("a"):
+                orientation_index = (orientation_index - 1) % len(ORIENTATIONS)
+                previous_pose = None
+                stable_frames = 0
+            elif key == ord("d"):
+                orientation_index = (orientation_index + 1) % len(ORIENTATIONS)
+                previous_pose = None
+                stable_frames = 0
+            elif key == ord("c") and data is not None and stable_frames >= 2:
+                save = Path(save)
+                save.parent.mkdir(parents=True, exist_ok=True)
+                save.write_text(json.dumps(data, indent=1), encoding="utf-8")
+                print(f"阵列自动标定已保存: {save}")
+                grid_label = ("四角插值网格 256 点" if manual_corners else
+                              f"实测网格 {data['board_matched']}/256")
+                print(f"方向 {data['orientation']}, {grid_label}, "
+                      f"姿态内点 {data['board_inliers']}, "
+                      f"定位方式 {data.get('board_pose_method', 'color')}")
+                return data
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 def calibrate(cam=0, save=CALIB_PATH, grid=3, span=0.06, backend=None,
@@ -1077,43 +1803,88 @@ def calibrate(cam=0, save=CALIB_PATH, grid=3, span=0.06, backend=None,
     cap, _ = open_source(cam, cam_settings, realsense=True, depth=True)
     detector = None
     idx, stable, frame_size = 0, [], None
-    window_name = "calibrate 3D (space=sample v=view r=redo q=quit)"
+    selected, review, review_error, confirmed = len(targets) - 1, None, None, False
+    window_name = "calibrate 3D (space=sample r=redo enter=finish)"
     window_open = False
     fullscreen = False
     view_mode = 0
     print("三维标定:以阵列中心为 (0,0,0), y 垂直离阵;每个 x/z 点先低后高采样")
     print("指尖准确落在提示的尺量位置后按空格;按 V 查看对齐深度图")
+    print("采样检查:相邻距离偏差 >5mm 或移动方向偏差 >20° 会提示 CHECK")
+    print("最后进入复核: A/D 选点, W 选最大残差点, R 重采, 回车验收")
+    print("复核时按 Q 结束:达标保存正式标定,超限保存诊断")
     try:
         detector = PalmDetector()
-        while idx < len(targets):
+        while True:
             ok, frame = read_frame(cap)
             if not ok:
                 break
             frame_size = (frame.shape[1], frame.shape[0])
-            observation = detector.detect(frame)
-            uv = observation.point(target) if observation is not None else None
-            point = cap.point_3d(uv, observation.mask) if uv is not None else None
-            if point is not None:
-                stable.append(point)
-                stable = stable[-15:]
+            reviewing = idx == len(targets)
+            if reviewing:
+                if review is None:
+                    src = np.asarray(samples, float)
+                    dst = np.asarray(targets, float)
+                    try:
+                        R, t, errors = fit_rigid_transform(src, dst)
+                    except ValueError as exc:
+                        review_error = str(exc)
+                        review = (None, None, None, float("inf"), float("inf"))
+                        print(f"复核: 三维拟合失败({exc});请选择点重采")
+                    else:
+                        rms_mm = float(np.sqrt(np.mean(errors ** 2)) * 1000)
+                        max_mm = float(np.max(errors) * 1000)
+                        review = (R, t, errors, rms_mm, max_mm)
+                        print(f"复核: RMS {rms_mm:.1f}mm (限 {FORMAL_RMS_LIMIT_MM:.0f}), "
+                              f"最大 {max_mm:.1f}mm (限 {FORMAL_MAX_LIMIT_MM:.0f})")
+                        for i, error in enumerate(errors, 1):
+                            print(f"  {i:2d}/{len(targets)} 残差 {error * 1000:.1f}mm")
+                _, _, errors, rms_mm, max_mm = review
+                tx, ty, tz = targets[selected]
+                summary = (f"REVIEW fit failed; redo samples" if review_error else
+                           f"REVIEW RMS={rms_mm:.1f}/{FORMAL_RMS_LIMIT_MM:.0f}mm  "
+                           f"MAX={max_mm:.1f}/{FORMAL_MAX_LIMIT_MM:.0f}mm")
+                selected_error = ("" if review_error else
+                                  f" error={errors[selected] * 1000:.1f}mm")
+                lines = [(summary, review_error is not None or
+                          rms_mm > FORMAL_RMS_LIMIT_MM or max_mm > FORMAL_MAX_LIMIT_MM),
+                         (f"selected #{selected + 1}/{len(targets)} "
+                          f"x={tx:+.3f} y={ty:.3f} z={tz:+.3f}"
+                          f"{selected_error}", False),
+                         ("A/D select  W worst  R redo  ENTER check  Q save", False)]
+                observation, uv = None, None
+                disp = frame.copy()
             else:
-                stable.clear()
-            disp = draw_hand_observation(frame, observation, target)
-            tx, ty, tz = targets[idx]
-            lines = (f"[{idx + 1}/{len(targets)}] x={tx:+.3f} y={ty:.3f} z={tz:+.3f} m",
-                     f"depth={point[2]:.3f}m" if point is not None else "depth=--",
-                     f"samples={len(stable)} SPACE=save R=redo Q=quit")
-            for row, line in enumerate(lines):
+                observation = detector.detect(frame)
+                uv = observation.point(target) if observation is not None else None
+                point = cap.point_3d(uv, observation.mask) if uv is not None else None
+                if point is not None:
+                    stable.append(point)
+                    stable = stable[-15:]
+                else:
+                    stable.clear()
+                disp = draw_hand_observation(frame, observation, target)
+                tx, ty, tz = targets[idx]
+                lines = [(f"[{idx + 1}/{len(targets)}] x={tx:+.3f} y={ty:.3f} z={tz:+.3f} m", False),
+                         (f"depth={point[2]:.3f}m" if point is not None else "depth=--", False),
+                         (f"samples={len(stable)} SPACE=save R=redo Q=quit", False)]
+                if len(stable) >= 8:
+                    candidate = np.median(stable[-10:], axis=0)
+                    lines.extend((calibration_check_text(check), check["warn"])
+                                 for check in calibration_neighbor_checks(
+                                     samples, targets, idx, candidate))
+            for row, (line, warn) in enumerate(lines):
                 cv2.putText(disp, line, (10, 30 + row * 24), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55, (0, 255, 0), 1, cv2.LINE_AA)
+                            0.55, (0, 0, 255) if warn else (0, 255, 0), 1, cv2.LINE_AA)
             if view_mode:
                 depth_display = depth_colormap(cap.depth_m)
                 if uv is not None:
                     cv2.circle(depth_display, tuple(map(int, np.rint(uv))), 9,
                                (255, 255, 255), 2)
-                for row, line in enumerate(lines):
+                for row, (line, warn) in enumerate(lines):
                     cv2.putText(depth_display, line, (10, 30 + row * 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                (0, 0, 255) if warn else (255, 255, 255),
                                 1, cv2.LINE_AA)
                 disp = depth_display if view_mode == 1 else np.hstack((disp, depth_display))
             if not window_open:
@@ -1122,6 +1893,9 @@ def calibrate(cam=0, save=CALIB_PATH, grid=3, span=0.06, backend=None,
             cv2.imshow(window_name, disp)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
+                if reviewing and not review_error:
+                    confirmed = True
+                    break
                 raise SystemExit("标定被放弃")
             if key == ord("f"):
                 fullscreen = not fullscreen
@@ -1136,9 +1910,36 @@ def calibrate(cam=0, save=CALIB_PATH, grid=3, span=0.06, backend=None,
                     scale = min(1.0, 1400 / width, 800 / height)
                     cv2.resizeWindow(window_name, int(round(width * scale)),
                                      int(round(height * scale)))
+            if reviewing:
+                if key == ord("a"):
+                    selected = (selected - 1) % len(targets)
+                elif key == ord("d"):
+                    selected = (selected + 1) % len(targets)
+                elif key == ord("w"):
+                    if not review_error:
+                        selected = int(np.argmax(review[2]))
+                elif key == ord("r"):
+                    idx = selected
+                    samples[idx] = None
+                    review = None
+                    review_error = None
+                    stable.clear()
+                    print(f"  重采 #{idx + 1}/{len(targets)}: {targets[idx]}")
+                elif key in (10, 13):
+                    if review_error:
+                        print(f"  三维拟合失败({review_error});请先重采")
+                    elif (rms_mm > FORMAL_RMS_LIMIT_MM
+                          or max_mm > FORMAL_MAX_LIMIT_MM):
+                        print("  标定误差仍超限;按 W/R 重采,或按 Q 保存诊断并退出")
+                    else:
+                        confirmed = True
+                        break
+                continue
             if key == ord("r") and idx > 0:
                 idx -= 1
                 samples[idx] = None
+                review = None
+                review_error = None
                 stable.clear()
             elif key == ord(" ") and len(stable) >= 8:
                 cloud = np.asarray(stable[-10:])
@@ -1147,36 +1948,34 @@ def calibrate(cam=0, save=CALIB_PATH, grid=3, span=0.06, backend=None,
                     print("  指尖或深度跳动超过 8mm,请停稳后重采")
                     stable.clear()
                     continue
+                checks = calibration_neighbor_checks(samples, targets, idx, center)
                 samples[idx] = center
                 print(f"  {idx + 1}/{len(targets)} "
                       f"(x={tx:+.3f}, y={ty:.3f}, z={tz:+.3f}) <- {center.round(4)}")
-                if idx % 2 == 1:
-                    measured = float(np.linalg.norm(samples[idx] - samples[idx - 1]))
-                    print(f"  相机三维两点直线距离 {measured * 1000:.1f}mm "
-                          f"(标称高度步长 {height_step * 1000:.1f}mm;仅供参考)")
-                idx += 1
+                for check in checks:
+                    print("  " + calibration_check_text(check))
+                selected = idx
+                idx = next((i for i, sample in enumerate(samples) if sample is None),
+                           len(targets))
+                review = None
+                review_error = None
                 stable.clear()
     finally:
         cap.release()
         cv2.destroyAllWindows()
         if detector is not None:
             detector.close()
-    if any(p is None for p in samples):
-        raise SystemExit("有标定点未采样,标定未完成")
+    if not confirmed or any(p is None for p in samples):
+        raise SystemExit("有标定点未采样或尚未按回车确认,标定未完成")
 
     src = np.array(samples, float)
     dst = np.array(targets, float)
-    try:
-        R, t, errors = fit_rigid_transform(src, dst)
-    except ValueError as exc:
-        raise SystemExit(f"三维标定失败: {exc}") from exc
-    rms_mm = float(np.sqrt(np.mean(errors ** 2)) * 1000)
-    max_mm = float(np.max(errors) * 1000)
+    R, t, errors, rms_mm, max_mm = review
     print(f"拟合轴约定: determinant={np.linalg.det(R):+.0f};逐点残差(mm):")
     for i, (expected, error) in enumerate(zip(dst, errors), 1):
         print(f"  {i:2d} x={expected[0]:+.3f} y={expected[1]:.3f} "
               f"z={expected[2]:+.3f}: {error * 1000:.1f}")
-    if rms_mm > 10 or max_mm > 20:
+    if rms_mm > FORMAL_RMS_LIMIT_MM or max_mm > FORMAL_MAX_LIMIT_MM:
         diagnostic = save.with_name(save.stem + "_diagnostic.json")
         diagnostic.parent.mkdir(parents=True, exist_ok=True)
         diagnostic.write_text(json.dumps({
@@ -1184,6 +1983,7 @@ def calibrate(cam=0, save=CALIB_PATH, grid=3, span=0.06, backend=None,
             "R": R.tolist(), "t": t.tolist(), "errors_mm": (errors * 1000).tolist(),
             "points": {"world": dst.tolist(), "camera": src.tolist()},
             "serial": cap.serial, "frame_size": frame_size,
+            "rotation": cap.rotation,
         }, indent=1), encoding="utf-8")
         raise SystemExit(f"标定残差过大(RMS {rms_mm:.1f}mm,最大 {max_mm:.1f}mm),未保存正式标定。"
                          f"逐点诊断已存 {diagnostic}")
@@ -1191,6 +1991,7 @@ def calibrate(cam=0, save=CALIB_PATH, grid=3, span=0.06, backend=None,
             "rms_mm": rms_mm, "max_mm": max_mm, "grid": grid, "span_m": span,
             "heights_m": [dist, dist + height_step], "target": target,
             "frame_size": frame_size, "stream": "color", "serial": cap.serial,
+            "rotation": cap.rotation,
             "determinant": float(np.linalg.det(R)),
             "points": {"world": dst.tolist(), "camera": src.tolist()}}
     save.parent.mkdir(parents=True, exist_ok=True)
@@ -1208,13 +2009,21 @@ def run_tracking(calib=None, port=None, kind="focus", dist=0.12, m=1,
                  sim=False, sim_seconds=8.0, deadband_m=None, lost_s=0.5,
                  bounds=DEFAULT_BOUNDS, backend=None, realsense=False,
                  target="index_tip", experimental=False, max_seconds=None,
-                 experimental_span=0.03, experimental_height=(0.09, 0.16)):
+                 experimental_span=0.03, experimental_height=(0.09, 0.16),
+                 allow_high_error=False, manual_tip_enabled=False,
+                 view_3d=False, phase_trace=False):
     """跟踪主循环。返回 PalmFollower.stats。
     dry=True 只打印不连板;sim=True 用合成圆路径(无需摄像头/标定)。"""
     if not sim and calib is None:
         raise SystemExit("摄像头模式需要标定文件:先运行 calibrate,或用 --sim")
     if dry and port:
         raise SystemExit("--dry 与 --port 互斥")
+    if view_3d and sim:
+        raise SystemExit("--view-3d 需要 RealSense 实时画面，不能与 --sim 同用")
+    if allow_high_error and not experimental:
+        raise SystemExit("--allow-high-error 只能与 --experimental 一起使用")
+    if manual_tip_enabled and experimental:
+        raise SystemExit("--manual-tip 不能与 --experimental 同时使用")
     if experimental:
         if sim or kind != "focus" or target != "index_tip" or no_mod:
             raise SystemExit("实验模式仅允许 RealSense 食指尖 focus + 调制")
@@ -1237,7 +2046,9 @@ def run_tracking(calib=None, port=None, kind="focus", dist=0.12, m=1,
     if not 0 < deadband_m <= 0.02:
         raise SystemExit("--deadband 须在 0-0.02 m 之间")
     if not sim:
-        R, translation = validate_calibration(calib, target, experimental=experimental)
+        R, translation = validate_calibration(
+            calib, target, experimental=experimental,
+            allow_high_error=allow_high_error)
         if not realsense and load_cam_settings().get("backend") != "realsense":
             raise SystemExit("三维跟踪需要 --realsense 彩色+深度流")
 
@@ -1246,6 +2057,10 @@ def run_tracking(calib=None, port=None, kind="focus", dist=0.12, m=1,
     supervisor = None
     cap = None
     detector = None
+    diagnostic_view = None
+    partial_tip = PartialTipTracker()
+    manual_tip = False
+    manual_confirmations = 0
     if not dry:
         board = Board(port)
         if no_mod:
@@ -1268,6 +2083,7 @@ def run_tracking(calib=None, port=None, kind="focus", dist=0.12, m=1,
 
     follower = PalmFollower(emit, kind=kind, dist=dist, m=m,
                             deadband_m=deadband_m, lost_s=lost_s, bounds=bounds)
+    last_phase_payload = None
     gate_counts = {name: 0 for name in ("no_frame", "no_hand", "no_depth",
                     "invalid_position", "outside_x", "outside_y", "outside_z",
                     "inside", "steady")}
@@ -1295,7 +2111,62 @@ def run_tracking(calib=None, port=None, kind="focus", dist=0.12, m=1,
             cap, _ = open_source(cam, cam_settings, realsense=True, depth=True)
             if calib.get("serial") and calib["serial"] != cap.serial:
                 raise RuntimeError("RealSense 序列号与标定时不同;请重新标定")
+            if calib.get("rotation", "none") != getattr(cap, "rotation", "none"):
+                raise RuntimeError("相机画面方向与标定时不同;请重新标定")
+            if calib.get("mode") == "realsense_board_3d":
+                manual_board = calib.get("board_pose_method") == "depth_corners"
+                fixed_grid = None
+                if manual_board and calib.get("board_grid_model") != "undistorted_rays":
+                    print("旧四角标定: 使用实时相机内参重建去畸变网格并复核阵列姿态")
+                print("正在从画面重新定位阵列;请先移开阵列上方的手")
+                deadline = time.perf_counter() + 8.0
+                last_error = "未读取到相机画面"
+                previous_pose = None
+                while time.perf_counter() < deadline:
+                    ok, board_frame = read_frame(cap, timeout_s=0.3)
+                    if not ok:
+                        continue
+                    if tuple(calib["frame_size"]) != (board_frame.shape[1],
+                                                       board_frame.shape[0]):
+                        raise RuntimeError("相机分辨率与阵列定向时不同;请重新运行 boardcalibrate")
+                    try:
+                        if manual_board and fixed_grid is None:
+                            fixed_grid = grid_from_camera_corners(
+                                cap, calib["board_corners_px"])
+                        fresh, _ = board_pose_from_frame(
+                            cap, board_frame, calib["orientation"],
+                            grid=fixed_grid, manual_corners=manual_board)
+                    except ValueError as exc:
+                        last_error = str(exc)
+                        previous_pose = None
+                        continue
+                    if manual_board and not board_poses_agree(
+                            calib, fresh, position_m=0.02, angle_deg=6.0):
+                        raise RuntimeError(
+                            "相机/阵列位置相对四角标定已变化;请重新运行 boardcalibrate --manual-corners")
+                    if not board_poses_agree(previous_pose, fresh):
+                        previous_pose = fresh
+                        last_error = "相邻帧板面姿态不稳定;请固定相机并露出完整阵列"
+                        continue
+                    R = np.asarray(fresh["R"], float)
+                    translation = np.asarray(fresh["t"], float)
+                    grid_label = ("四角插值网格 256 点" if manual_board else
+                                  f"实测网格 {fresh['board_matched']}/256")
+                    print(f"阵列已重新定位: {grid_label}, "
+                          f"姿态内点 {fresh['board_inliers']}, "
+                          f"定位方式 {fresh.get('board_pose_method', 'color')}")
+                    break
+                else:
+                    raise RuntimeError(f"阵列识别失败,未发射: {last_error}")
+            if 0.07 <= translation[1] <= 0.7 and translation[1] - bounds[1][1] < 0.07:
+                print(f"近距提醒: 相机约高于板面 {translation[1] * 100:.1f}cm; "
+                      f"目标高于约 {(translation[1] - 0.07) * 100:.1f}cm 时，"
+                      "正对相机处可能因深度小于 7cm 而 no_depth")
             detector = PalmDetector()
+            if view_3d:
+                from live_diagnostic_3d import LiveDiagnostic3D
+                diagnostic_view = LiveDiagnostic3D(dry=dry, freq=freq,
+                                                  duty=duty, no_mod=no_mod)
             if not dry:
                 supervisor = LossSupervisor(
                     follower, on_error=mod.stop if mod is not None else board.off).start()
@@ -1311,18 +2182,77 @@ def run_tracking(calib=None, port=None, kind="focus", dist=0.12, m=1,
             window_name = "hand track (q=quit)"
             window_open = False
             fullscreen = False
+            pending_click = None
+            paused_3d = False
+            pause_started = None
+            last_preview = None
+
+            def toggle_3d_pause():
+                nonlocal paused_3d, pause_started, pending_click
+                nonlocal manual_tip, manual_confirmations, missing_since, started
+                if diagnostic_view is None:
+                    return
+                if not paused_3d:
+                    # Keep the rendered snapshot while ensuring the hardware goes silent.
+                    follower.pause(time.perf_counter())
+                    partial_tip.clear()
+                    manual_tip = False
+                    manual_confirmations = 0
+                    pending_click = None
+                    paused_3d = True
+                    pause_started = time.perf_counter()
+                    diagnostic_view.set_paused(True)
+                    if last_preview is not None:
+                        frozen = last_preview.copy()
+                        cv2.putText(frozen, "PAUSED / OUTPUT OFF - Space to resume",
+                                    (10, 188), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.65, (0, 0, 255), 2, cv2.LINE_AA)
+                        cv2.imshow(window_name, frozen)
+                    print("3D 画面已冻结；板卡已关断。空格恢复")
+                else:
+                    paused_3d = False
+                    started += time.perf_counter() - pause_started
+                    pause_started = None
+                    partial_tip.clear()
+                    manual_tip = False
+                    manual_confirmations = 0
+                    pending_click = None
+                    missing_since = None
+                    diagnostic_view.set_paused(False)
+                    print("3D 画面已恢复；等待新的相机帧")
+
+            def on_target_click(event, x, y, _flags, _param):
+                nonlocal pending_click
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    pending_click = (x, y)
+
             while True:
-                if max_seconds is not None and time.perf_counter() - started >= max_seconds:
-                    break
                 if supervisor is not None and supervisor.error is not None:
                     raise RuntimeError("丢手监督线程关断失败") from supervisor.error
                 if mod is not None and mod.error is not None:
                     raise RuntimeError("调制线程串口写入失败") from mod.error
+                if diagnostic_view is not None:
+                    if not diagnostic_view.poll():
+                        break
+                    if diagnostic_view.consume_pause_toggle():
+                        toggle_3d_pause()
+                if paused_3d:
+                    key = cv2.waitKey(20) & 0xFF if window_open else 255
+                    if key in (ord("q"), 27):
+                        break
+                    if key == ord(" "):
+                        toggle_3d_pause()
+                    continue
+                if max_seconds is not None and time.perf_counter() - started >= max_seconds:
+                    break
                 ok, frame = read_frame(cap, timeout_s=0.2)
                 if not ok:
                     gate_counts["no_frame"] += 1
                     now = time.perf_counter()
-                    follower.feed(now, None)
+                    follower.pause(now)
+                    partial_tip.clear()
+                    manual_tip = False
+                    manual_confirmations = 0
                     if missing_since is None:
                         missing_since = now
                     if now - missing_since >= 2.0:
@@ -1335,8 +2265,53 @@ def run_tracking(calib=None, port=None, kind="focus", dist=0.12, m=1,
                 if calib.get("stream") and calib["stream"] != (cap.stream_name if isinstance(cap, RealSenseSource) else "uvc"):
                     raise RuntimeError("相机彩色/红外流与标定时不同;请重新标定")
                 observation = detector.detect(frame)
-                uv = observation.point(target) if observation is not None else None
-                camera_point = cap.point_3d(uv, observation.mask) if uv is not None else None
+                if pending_click is not None:
+                    selected = choose_hand_target(observation, pending_click)
+                    if manual_tip_enabled and selected is None:
+                        follower.pause(t)
+                        manual_tip = True
+                        confirmed = partial_tip.seed(
+                            frame, getattr(cap, "depth_m", None), pending_click, t)
+                        manual_confirmations = 0
+                        if confirmed:
+                            print("局部指尖已选定: 身份未知，按图像和深度跟踪")
+                        else:
+                            print("局部指尖未确认: 请点击前景中纹理清晰的指尖")
+                    pending_click = None
+                    if selected is not None and (selected != target or manual_tip):
+                        follower.pause(t)
+                        target = selected
+                        manual_tip = False
+                        manual_confirmations = 0
+                        partial_tip.clear()
+                        print(f"跟踪目标切换: {target}")
+                source = "manual tip" if manual_tip else "MediaPipe"
+                if manual_tip:
+                    uv = partial_tip.update(frame, getattr(cap, "depth_m", None), t)
+                    if uv is None:
+                        manual_confirmations = 0
+                    else:
+                        manual_confirmations += 1
+                        if manual_confirmations < 3:
+                            uv = None
+                else:
+                    uv = observation.point(target) if observation is not None else None
+                    if uv is not None:
+                        if not experimental:
+                            partial_tip.seed(frame, getattr(cap, "depth_m", None), uv, t)
+                    elif not experimental:
+                        uv = partial_tip.update(frame, getattr(cap, "depth_m", None), t)
+                        if uv is not None:
+                            source = "partial tip"
+                mask = (observation.mask if source == "MediaPipe" and observation is not None
+                        else None)
+                camera_point = cap.point_3d(uv, mask) if uv is not None else None
+                if uv is not None and camera_point is None:
+                    partial_tip.clear()
+                    manual_confirmations = 0
+                if uv is None or camera_point is None:
+                    source = "no tip"
+                    follower.pause(t)
                 pos = R @ camera_point + translation if camera_point is not None else None
                 gate = tracking_gate(uv, camera_point, pos, bounds)
                 gate_counts[gate] += 1
@@ -1347,9 +2322,31 @@ def run_tracking(calib=None, port=None, kind="focus", dist=0.12, m=1,
                     outside_y_values.append(float(pos[1]))
                 sent_before = follower.stats["sent"]
                 follower.feed(t, pos)
+                if phase_trace and follower.stats["sent"] != sent_before:
+                    command = follower.command_snapshot()
+                    if command is not None:
+                        line, last_phase_payload = phase_diagnostic(
+                            *command, last_phase_payload, kind=kind)
+                        print(f"[phase {'dry' if dry else 'serial write OK'}] {line}")
+                if diagnostic_view is not None:
+                    if not diagnostic_view.update(
+                            cap, R, translation, observation, pos,
+                            follower.focus_position(), follower.phase_snapshot(),
+                            gate):
+                        break
+                    if diagnostic_view.consume_pause_toggle():
+                        toggle_3d_pause()
+                        continue
                 if gate == "inside" and follower.stats["sent"] == sent_before:
                     gate_counts["steady"] += 1
-                disp = draw_hand_observation(frame, observation, target)
+                disp = draw_hand_observation(frame, observation, target,
+                                             selectable=True)
+                if source != "MediaPipe" and uv is not None:
+                    cv2.circle(disp, tuple(np.rint(uv).astype(int)), 9,
+                               (0, 0, 255), 2, cv2.LINE_AA)
+                cv2.putText(disp, f"target: {target if source == 'MediaPipe' else 'unknown'} ({source})",
+                            (10, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                            (0, 255, 255), 1, cv2.LINE_AA)
                 status = ("ACTIVE (unchanged phase)" if gate == "inside"
                           and follower.stats["sent"] == sent_before else
                           "ACTIVE (phase updated)" if gate == "inside" else
@@ -1362,10 +2359,10 @@ def run_tracking(calib=None, port=None, kind="focus", dist=0.12, m=1,
                                 f"y={pos[1]*100:.1f}cm  z={pos[2]*100:+.1f}cm",
                                 (10, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                 (0, 255, 255), 1, cv2.LINE_AA)
-                    cv2.putText(disp, f"allowed y={bounds[1][0]*100:.0f}-"
-                                f"{bounds[1][1]*100:.0f}cm", (10, 158),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255),
-                                1, cv2.LINE_AA)
+                cv2.putText(disp, f"allowed y={bounds[1][0]*100:.0f}-"
+                            f"{bounds[1][1]*100:.0f}cm", (10, 158),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255),
+                            1, cv2.LINE_AA)
                 if uv:
                     if pos is not None:
                         cv2.putText(disp, f"x={pos[0]:+.3f} y={pos[1]:.3f} z={pos[2]:+.3f}",
@@ -1373,15 +2370,29 @@ def run_tracking(calib=None, port=None, kind="focus", dist=0.12, m=1,
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1,
                                     cv2.LINE_AA)
                     else:
-                        cv2.putText(disp, "depth unavailable", (10, 75),
+                        cv2.putText(disp, "depth unavailable", (10, 210),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1, cv2.LINE_AA)
+                draw_tracking_focus(disp, follower.focus_position(),
+                                    R, translation, cap, bounds=bounds,
+                                    observed=pos, gate=gate)
                 if not window_open:
                     open_preview_window(window_name, disp)
+                    cv2.setMouseCallback(window_name, on_target_click)
                     window_open = True
                 cv2.imshow(window_name, disp)
+                last_preview = disp
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
+                if key in (ord("q"), 27):
                     break
+                if key == ord(" ") and diagnostic_view is not None:
+                    toggle_3d_pause()
+                    continue
+                if key == ord("r"):
+                    partial_tip.clear()
+                    manual_tip = False
+                    manual_confirmations = 0
+                    follower.pause(time.perf_counter())
+                    print("局部指尖已清除，发射静默")
                 if key == ord("f"):
                     fullscreen = not fullscreen
                     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN,
@@ -1402,6 +2413,8 @@ def run_tracking(calib=None, port=None, kind="focus", dist=0.12, m=1,
                 board.close()
             if detector is not None:
                 detector.close()
+            if diagnostic_view is not None:
+                diagnostic_view.close()
             if cap is not None:
                 cap.release()
                 cv2.destroyAllWindows()
@@ -1438,6 +2451,8 @@ def main(argv=None):
                     help="强制视频后端(打不开画面时试 msmf)")
     ct.add_argument("--realsense", action="store_true",
                     help="Intel RealSense D4xx:用官方 SDK 采彩色或红外流")
+    ct.add_argument("--rotate", choices=ROTATIONS, default=None,
+                    help="旋转 RealSense 彩色/深度预览并保存设置；本机俯视安装用 ccw")
     ct.add_argument("--target", choices=TARGETS, default="index_tip",
                     help="预览目标点(默认食指尖)")
     ct.add_argument("--depth", action="store_true",
@@ -1459,13 +2474,24 @@ def main(argv=None):
     c.add_argument("--height-step", type=float, default=0.05,
                    help="第二层比第一层高多少 [m],默认 0.05")
 
+    b = sub.add_parser("boardcalibrate", help="识别 16x16 换能器并确认阵列正轴")
+    b.add_argument("--realsense", action="store_true",
+                   help="使用 RealSense 彩色+深度流(本命令默认启用)")
+    b.add_argument("--save", default=str(BOARD_CALIB_PATH))
+    b.add_argument("--manual-corners", action="store_true",
+                   help="自动圆孔识别不稳定时,点四角并用对齐深度求板面三维姿态")
+
     t = sub.add_parser("track", help="跟踪发射")
     t.add_argument("--cam", type=int, default=0)
     t.add_argument("--backend", choices=("dshow", "msmf", "any"), default=None)
     t.add_argument("--realsense", action="store_true")
     t.add_argument("--calib", default=str(CALIB_PATH))
+    t.add_argument("--auto-board", action="store_true",
+                   help="使用板面自动标定,每次启动重新识别阵列姿态")
     t.add_argument("--experimental", action="store_true",
                    help="用最近一次失败的三维诊断做限时低占空比中心区域实验")
+    t.add_argument("--allow-high-error", action="store_true",
+                   help="明确放行当前 RMS<=20mm/最大<=40mm 的临时诊断，仅用于短时低占空比实验")
     t.add_argument("--experimental-span", type=float, default=0.03,
                    help="实验模式 x/z 半宽 [m],默认 0.03,最大 0.08")
     t.add_argument("--experimental-height", type=float, nargs=2, metavar=("MIN", "MAX"),
@@ -1483,40 +2509,77 @@ def main(argv=None):
     t.add_argument("--no-mod", action="store_true", help="不调制,直接逐帧发送")
     t.add_argument("--deadband", type=float, default=None,
                    help="重发死区 [m],普通模式默认 0.005,实验模式默认 0.002")
+    t.add_argument("--height-max", type=float, default=None,
+                   help="普通跟踪最高高度 [m],默认 0.25,允许 0.15-0.28")
+    t.add_argument("--span", type=float, default=None,
+                   help="普通跟踪 x/z 半宽 [m],默认 0.08,允许 0.02-0.08")
     t.add_argument("--lost", type=float, default=0.5, help="丢手静默阈值 [s]")
     t.add_argument("--max-seconds", type=float, default=None,
                    help="自动结束时间 [s];实验模式默认并最多 20 秒")
     t.add_argument("--target", choices=TARGETS, default="index_tip",
-                   help="跟踪目标点(必须与标定一致;默认食指尖)")
+                   help="初始跟踪目标;运行中可在画面点击任意手部关键点")
+    t.add_argument("--manual-tip", action="store_true",
+                   help="允许点击身份未知的局部指尖;请先 dry run 检查，正式发射需显式启用")
+    t.add_argument("--view-3d", action="store_true",
+                   help="实时 3D 诊断: 手部点云、板卡、焦点和预测声场")
+    t.add_argument("--phase-trace", action="store_true",
+                   help="打印实际下发的目标坐标、相位变化数和帧摘要")
 
     args = p.parse_args(argv)
     if args.cmd == "cams":
         list_cams(max_index=args.max)
     elif args.cmd == "camtest":
         camtest(cam=args.cam, backend=args.backend, realsense=args.realsense,
-                target=args.target, depth=args.depth, pointcloud=args.pointcloud)
+                target=args.target, depth=args.depth, pointcloud=args.pointcloud,
+                rotation=args.rotate)
     elif args.cmd == "calibrate":
         calibrate(cam=args.cam, save=Path(args.save), grid=args.grid,
                   span=args.span, backend=args.backend, realsense=args.realsense,
                   target=args.target, dist=args.dist, height_step=args.height_step)
+    elif args.cmd == "boardcalibrate":
+        boardcalibrate(save=Path(args.save), manual_corners=args.manual_corners)
     else:
         calib = None
+        if args.auto_board and args.experimental:
+            raise SystemExit("--auto-board 与 --experimental 不能同时使用")
+        if args.height_max is not None and not 0.15 <= args.height_max <= 0.28:
+            raise SystemExit("--height-max 须在 0.15-0.28 m 之间")
+        if args.span is not None and not 0.02 <= args.span <= 0.08:
+            raise SystemExit("--span 须在 0.02-0.08 m 之间")
+        if args.experimental and args.height_max is not None:
+            raise SystemExit("实验模式请使用 --experimental-height 设置高度范围")
+        if args.experimental and args.span is not None:
+            raise SystemExit("实验模式请使用 --experimental-span 设置中心范围")
+        span = args.span if args.span is not None else DEFAULT_BOUNDS[0][1]
+        bounds = ((-span, span),
+                  (DEFAULT_BOUNDS[1][0], args.height_max or DEFAULT_BOUNDS[1][1]),
+                  (-span, span))
         if not args.sim:
-            path = DIAGNOSTIC_PATH if args.experimental and args.calib == str(CALIB_PATH) else Path(args.calib)
+            path = (BOARD_CALIB_PATH if args.auto_board else
+                    DIAGNOSTIC_PATH if args.experimental and args.calib == str(CALIB_PATH)
+                    else Path(args.calib))
             if not path.exists():
-                raise SystemExit(f"找不到标定文件 {path}:先运行 calibrate")
+                raise SystemExit(f"找不到标定文件 {path}:先运行相应的标定命令")
             loaded = json.loads(path.read_text(encoding="utf-8"))
-            calib = calibration_from_diagnostic(loaded) if args.experimental else loaded
-            print(f"标定载入: RMS {calib.get('rms_mm', '?')} mm")
+            calib = (calibration_from_diagnostic(
+                loaded, allow_high_error=args.allow_high_error)
+                     if args.experimental else loaded)
+            if calib.get("mode") == "realsense_board_3d":
+                print(f"阵列方向载入: +X/+Z={calib['orientation']}")
+            else:
+                print(f"标定载入: RMS {calib.get('rms_mm', '?')} mm")
         run_tracking(calib=calib, port=args.port, kind=args.kind, dist=args.dist,
                      m=args.m, freq=args.freq, duty=args.duty, no_mod=args.no_mod,
                      cam=args.cam, dry=args.dry, sim=args.sim,
                      sim_seconds=args.sim_seconds, deadband_m=args.deadband,
-                     lost_s=args.lost, backend=args.backend,
+                     lost_s=args.lost, bounds=bounds, backend=args.backend,
                      realsense=args.realsense, target=args.target,
                      experimental=args.experimental, max_seconds=args.max_seconds,
                      experimental_span=args.experimental_span,
-                     experimental_height=args.experimental_height)
+                     experimental_height=args.experimental_height,
+                     allow_high_error=args.allow_high_error,
+                     manual_tip_enabled=args.manual_tip,
+                     view_3d=args.view_3d, phase_trace=args.phase_trace)
 
 
 if __name__ == "__main__":

@@ -179,24 +179,139 @@ cd D:\Mima\SonicSurface
 
 ## 手部指尖跟踪(hand_track.py)
 
+### 阵列自动定位（俯视 RealSense）
+
+摄像头直接识别 16x16 换能器圆孔，利用已知 10.5mm 阵元间距和相机内参
+确定阵元编号，优先用对齐深度图拟合阵列三维姿态；有效板面深度不足时回退到
+彩色图 PnP。不再需要手持指尖采 18 个点。圆形阵列完全对称，无法从
+圆孔本身判断硬件 +X/+Z：首次打开 `boardcalibrate`，用 A/D 切换八种方向，
+确认画面箭头指向硬件实际正轴、绿色框贴合阵列四边且显示
+`pose stable 2/2` 后按 C 保存。另存
+`results/hand_tracking/hand_track_board_calib.json`，原手工标定不被覆盖。
+不要只根据画面上下左右猜硬件正轴；先核对板角/通道定义。
+
+```powershell
+.\ultrasound_solver\.venv\Scripts\python.exe -X utf8 MyPatterns\hand_track.py boardcalibrate --realsense
+.\ultrasound_solver\.venv\Scripts\python.exe -X utf8 MyPatterns\hand_track.py track --realsense --auto-board --dry --max-seconds 10
+.\ultrasound_solver\.venv\Scripts\python.exe -X utf8 MyPatterns\hand_track.py track --realsense --auto-board --port COM8 --duty 0.2 --lost 0.2 --max-seconds 10
+```
+
+若圆孔自动识别反复失败，可改用
+以下四角深度模式：
+
+```powershell
+.\ultrasound_solver\.venv\Scripts\python.exe -X utf8 MyPatterns\hand_track.py boardcalibrate --realsense --manual-corners
+```
+
+依次左键点阵列最外侧阵元的
+左上、右上、右下、左下中心，右键可撤销最后一点。深度图会拟合板面姿态；
+确认绿色框、轴方向和 `pose stable 2/2` 后按 C。此方式保存四角像素位置，
+后续 `--auto-board` 启动会用深度复查板面，但相机和板子都必须保持固定；
+移动相机后需重新点四角。若深度图没有至少 50 个有效板面点，会拒绝保存。
+标定窗口按 S 可保存当前彩色图和对齐深度到
+`results/hand_tracking/board_depth_diagnostic.npz` 供排查。
+
+跟踪画面中红圈是识别出的当前目标，紫圈是当前发送相位对应的**计算焦点**，
+青色十字是该焦点沿板面法线落在阵列上的垂足，橙框是阵列阵元范围。
+普通跟踪窗口会画出手部骨架；左键点击任意可见关节或指尖即可切换发射目标，
+顶部 `target` 显示当前部位。切换时旧焦点先关断，再用新部位的深度计算焦点。
+也可在启动时用 `--target middle_tip` 等指定初始部位；`palm` 为腕部与
+中指根部的中点。板面三维标定的坐标变换适用于这些部位，无需按手指重标。
+绿色框是**指尖当前高度**的 x/z 允许范围，不能拿板面橙框与空中的指尖
+直接比较；红叉及 `outside x/y/z` 表示本帧越界关断，`no_depth` 表示相机
+没有取得可靠指尖深度。显示 `ACTIVE` 但手感较弱时，先检查声场偏轴衰减。
+当手移动到画面边缘，程序会尝试给画面补边再做一次 MediaPipe 检测。若整手
+关键点暂时丢失，已确认的指尖可由局部图像和 RealSense 深度短时续跟；匹配
+失败、深度失效、相机无帧或目标出界都会立即静默。只有一根手指从开始就入镜
+时，可加 `--manual-tip`，在普通 `track` 预览里左键点击可见指尖；连续三帧
+匹配成功且指尖比背景更近，才会激活焦点。此时显示 `unknown (manual tip)`：
+单根手指无法可靠判断是哪根手指，也无法判断点击的物体一定是手指。
+误点后按 `r` 立刻清除并静默；
+先用 `--dry --manual-tip` 检查红圈与紫圈，确认后正式发射仍须显式加
+`--manual-tip`；`--experimental` 禁用身份未知的局部模式。为获得最稳的识别，
+仍建议移动或抬高相机、扩大视野，让手掌与目标手指都留在画面内。
+手动四角标定会用 RealSense 彩色镜头内参在去畸变射线空间插值阵元；
+旧四角文件在启动时也会按实时内参重建网格并复核深度姿态。
+焦点标记是模型预测，不是声压实测。普通跟踪默认允许 y=7-25cm，已经
+超过 20cm；但当前相机约高于板面 28.5cm，指尖接近 21.5cm 高时，
+正对相机的深度可能已小于 D405 的 7cm 最小值，出现 `no_depth`。
+要稳定跟踪更高的位置需抬高相机并重新标定；`--height-max 0.27` 只能
+改变软件门限，无法扩大相机近距深度能力。
+指尖深度会优先选择遮罩内最近的可靠深度层，减少背景被误认为指尖。
+
+阵元间距 10.5mm 大于 40kHz 波长 8.65mm：偏轴聚焦会有栅瓣。
+例如模拟 `x=+5cm,y=12cm,z=0` 时，在 `x≈-7cm` 有约 48% 主焦点声压幅度的次峰，
+因此远离中心感到两个强点不一定是坐标标定错误。可先在中心附近比较。
+要独立于相机核对真实声学方向，可运行限时调制焦点检查：
+
+```powershell
+.\ultrasound_solver\.venv\Scripts\python.exe -X utf8 MyPatterns\my_patterns.py focusprobe --dry
+.\ultrasound_solver\.venv\Scripts\python.exe -X utf8 MyPatterns\my_patterns.py focusprobe --port COM8 --dist 0.12 --offset 0.04 --dur 8 --freq 200 --duty 0.2
+```
+
+实物命令依次检查中心、+X、-X、+Z、-Z。每步按回车后以 200Hz/20% 调制
+发射 8 秒，随后自动关闭；输入 q 回车可结束。可把 `--dur` 提至最多 15 秒，
+`--static` 则恢复连续静态对照。记录每步最强触点相对板中心在相机画面的
+上/下/左/右方，以及是否有对侧第二峰；不要拿 `boardcalibrate` 的箭头
+当作独立依据，因为那是手动选定的轴方向。中心正确但四轴整体旋转或镜像，
+应重新确认板轴方向；方向正确但对侧另有峰，则优先排查栅瓣。
+**实验性偏轴抑制**：周期阵列在远场有角度混叠，固定的 10.5mm 间距
+无法靠相位算法实现整个空间“只有一个峰”。`focusprobe --algorithm suppress`
+只针对目标高度附近 ±2cm 的有限三维区域，迭代寻找最强副峰，在副峰周围
+加抑制约束，同时保留目标点能量；最终按板卡 32 档量化，并在 x/z ±12cm、
+目标高度 ±2cm 的独立密网格复核，要求最强点仍在目标附近。复核无改善时
+自动回退普通焦点。离线模型中，y=12cm、x/z=±4cm 的四个角点最强远处峰/
+目标峰约由 44–46% 降到 35–37%，但目标声压只保留约 81–83%；
+x/z=+6cm 的角点未通过验收，会回退。该输出只预测理想阵列的声压，
+不代表实物声场或手指触觉；更远处、其它高度也没有单峰保证。
+单个角点可先无板试算，再用同一位置分别运行普通和实验算法：
+
+```powershell
+.\ultrasound_solver\.venv\Scripts\python.exe -X utf8 MyPatterns\my_patterns.py focusprobe --algorithm suppress --point 0.04 0.04 --dry
+.\ultrasound_solver\.venv\Scripts\python.exe -X utf8 MyPatterns\my_patterns.py focusprobe --point 0.04 0.04 --port COM8
+.\ultrasound_solver\.venv\Scripts\python.exe -X utf8 MyPatterns\my_patterns.py focusprobe --algorithm suppress --point 0.04 0.04 --port COM8
+```
+
+三条命令使用同一 200Hz/20% 调制、12cm 焦点高度、每次 8 秒自动关断。
+比较目标点和对侧的触感；固件相位校正、阵元差异和反射未进入模型。
+用 `--span 0.03` 将发射限制到中心 x/z ±3cm；默认仍为 ±8cm。
+可用 `--lost 0.35` 减少短暂丢手引起的关断；离开画面仍会自动关断。
+
+每次 `--auto-board` 启动都会先从实时画面重新识别阵列；需移开手并露出全部
+四角。识别不足、相邻帧姿态不稳定、姿态残差超限、序列号或画面方向不符时不发射。进入跟踪后
+应固定相机和阵列；暂不在手遮挡阵列时连续重估板面姿态。首次上板前先用
+`--dry` 核对指尖向硬件 +X/+Z 移动时坐标方向确实正确。
+
+### 手工三维标定
+
 RealSense 彩色画面 → MediaPipe 21 点找到指定指尖(默认 `index_tip`,第 8 点)
 → 对齐的深度图反投影成相机三维坐标 → 两层高度标定的刚体变换得到阵列
 `(x,y,z)` → One-Euro 滤波 + 5 mm 死区 → 相位 → Modulator(200 Hz 调制)。
 `y` 是指尖离阵列面的实际高度。红圈是目标点,绿色区域是关键点骨架生成的
 近似 mask,不是逐像素深度分割。深度孔洞、指尖丢失或三维坐标越界时静默。
 
-相机固定在阵列旁向上拍摄即可,不必让镜头平行于阵列。以阵列中心为原点,
+相机可从阵列旁或上方拍摄,不必让镜头平行于阵列。以阵列中心为原点,
 `x/z` 沿阵列面两个轴,`y` 垂直阵列面向上。用尺子在第一层 `y=0.10m`
 及第二层 `y=0.15m` 各准备 3x3 个位置:每层 `x/z` 取 -0.06,0,+0.06m。
 每个 `x/z` 位置先采 10cm、再采 15cm,然后才移动到下一个位置。
 按画面提示把**食指尖**放到每个三维位置,稳定后按空格;`r` 重采上一点,
 `q` 放弃。标定窗口按 `V` 可轮换彩色、深度、并排预览,检查标记处
-是否有有效指尖深度。每对采完会显示相机三维两点的直线距离;
-它不是指尖相对阵列面的高度,不会单独据此拒绝采样。相机与阵列不平行由
-最终三维变换处理。标定误差 RMS 超过 10mm 或单点超过 20mm 时不会保存。
+是否有有效指尖深度。采样时会检查与同排、相邻排及另一高度已采点的距离;
+`CHECK` 表示三维直线距离与标称步长相差超过 5mm,或移动方向与其他同轴
+步长相差超过 20 度。默认网格的高度步长标称 50mm,相邻行列标称 60mm;这些都是
+诊断提示,不会自动丢弃采样。第 18 点后进入复核画面,显示 RMS、最大误差
+及选中点残差;按 A/D 选点、W 选最大残差点、R 重采选中点、回车验收。
+误差仍超限时回车会留在复核画面。复核时按 Q 结束：达标保存正式标定，
+超限保存诊断；采样过程中按 Q 才会放弃。
+三维直线距离不是指尖相对阵列面的高度。相机与阵列不平行由
+最终三维变换处理。标定误差 RMS 超过 12mm 或单点超过 30mm 时不会保存。
 若误差超限,终端会逐点显示残差,并在同目录写入
 `hand_track_calib_3d_diagnostic.json`(原始相机三维点与提示位置)。重采前确认
 10/15cm 量到的是**指尖**而非手掌,以及画面红圈处 `depth` 数值稳定。
+相机改为俯视且画面侧转时,先运行 `camtest --realsense --depth --rotate ccw`
+检查画面方向并按 ESC 保存;若方向相反,改用 `--rotate cw`。旋转会同时作用于
+彩色和对齐深度,三维反投影仍使用传感器原始坐标。移动或旋转相机后必须重新
+标定;旧三维标定即使 RMS 合格也不再代表新的安装位置。
 
 ```bash
 py -3.13 MyPatterns/hand_track.py camtest --realsense                 # 看食指尖与 mask
@@ -204,7 +319,7 @@ py -3.13 MyPatterns/hand_track.py camtest --realsense --depth         # 彩色�
 py -3.13 MyPatterns/hand_track.py camtest --realsense --pointcloud    # 另开可旋转的实时 3D 点云
 py -3.13 MyPatterns/hand_track.py calibrate --realsense --dist 0.10 --height-step 0.05
 py -3.13 MyPatterns/hand_track.py track --realsense --dry            # 看 x/y/z,不发射
-py -3.13 MyPatterns/hand_track.py track --realsense --port COM8      # 三维坐标核对后连板
+py -3.13 MyPatterns/hand_track.py track --realsense --port COM8 --duty 0.2 --lost 0.2 --max-seconds 10  # 短时连板
 py -3.13 MyPatterns/hand_track.py track --sim --dry   # 合成圆路径离线回路(无需摄像头)
 ```
 
@@ -261,6 +376,32 @@ RMS ≤15mm、最大误差 ≤30mm,并强制 `focus`、中心 x/z ±3cm、y 9-16
   **待实测**:18 点三维标定与上板效果;先在 `--dry`
   预览中分别上下移动手指,确认 `y` 随之变化且 `x/z` 方向正确。
 
+## 接收器与示波器测量(receiver_probe.py)
+
+图中的银色圆柱顶部黑色网面是接收面。此工具让你在 RealSense 画面中用鼠标框选**黑面和一圈银色边框**，跟踪其中心并用三维标定换算到阵列坐标；它不识别接收器型号，也不自动读取示波器。鳄鱼夹和金属筒侧面不能当作敏感面中心。每个位置都让接收面朝向阵列，固定接收器与相机；示波器读 40 kHz 载波的 Vpp，保持同一探头、量程和设置，比较同一焦点目标在不同接收位置的 Vpp。Vpp 比值可比较相对响应；未做探头灵敏度标定时不能换算绝对声压。
+
+先在普通照片上检查选框中心（仅像素，无深度）：
+
+```powershell
+python -X utf8 MyPatterns\receiver_probe.py --image "D:\Mima\SonicSurface\receiver.jpeg"
+```
+
+实时测量需要有效的 RealSense 三维标定。`--target` 是固定发射焦点 `(x,y,z)`，单位米；下面示例默认不连接板卡，按 `e` 后只记录约 5 秒的接收器位置，并在终端输入外部发射时读到的 Vpp。外部发射由你自行控制。
+
+```powershell
+python -X utf8 MyPatterns\receiver_probe.py --target 0 0.12 0
+```
+
+若显式加 `--port COM8`，按 `e` 时程序发送静态焦点，默认 5 秒后关闭，再提示输入示波器 Vpp；按 `r` 重新框选，按 `q` 退出并关闭发射。测量时深度或跟踪丢失、接收器移动超过 8 mm 会取消记录并关闭本程序控制的发射。CSV 默认保存在 `results/hand_tracking/receiver_probe.csv`，包含预设焦点、接收面阵列坐标、位置偏差、Vpp、深度来源与跟踪分数。把接收器移到多个位置，在相同 `--target` 下重复按 `e` 才能比较副峰和主峰。接收器扫描允许 x/z 到 ±20 cm、y 为 5-30 cm，便于检查板外副峰；仍要求相机能看到接收面且深度有效。发射焦点目标仍限制在阵列工作范围内。
+
+```powershell
+python -X utf8 MyPatterns\receiver_probe.py --target 0.03 0.12 0 --port COM8 --duration 5
+```
+
+黑色网面没有可靠深度时，可加 `--allow-rim-depth` 用银色边框深度估计，并在 CSV 标为 `rim_estimate`；若边框深度也不一致则拒绝记录。这种几何估计尤其不能证明焦点准确，最终判断需看示波器读数。本工具尚未与真实相机、板卡和示波器联测。
+
+扫描后用 `python -X utf8 MyPatterns\receiver_probe.py --analyze MyPatterns\results\hand_tracking\receiver_probe.csv` 汇总每个固定目标已采样的最大 Vpp 位置、距目标偏差，以及远区（离目标至少 20 mm）与近区（10 mm 内）最大 Vpp 比。至少采 5 点且近远区都有样本；报告只代表已测点，若要排除其他副峰，还需覆盖关注的二维平面和不同高度。
+
 ## Python API
 
 ```python
@@ -300,7 +441,7 @@ animate(b, frames_orbit(0.16, 0.03, kind='vortex'), fps=20)
 1. **相位校正只在 FPGA 做**。你的固件 `Distribute.vhd` 已内置 `PHASE_CORRECTION`(= 仓库根目录 `超声波参数.txt`),
    本脚本发送**未校正**的原始相位——两边都加会重复叠加。Ultraino 软件里若也填了校正,同理只留一处。
 2. **发送后板子持续发射**(FPGA 双缓冲保持最后图案),断电或 `off` 命令才停。
-3. 阵元间距 10.5 mm > λ/2(4.3 mm):`steer` 大角度会出现栅瓣,仅小角度可用;聚焦/涡旋/图案不受影响。
+3. 阵元间距 10.5 mm > λ/2(4.3 mm):偏轴聚焦也会有栅瓣;中心焦点通常更干净。
 4. 幅度命令(251)与 200 Hz 调制(252)属于幅度版/触觉版固件,你的 primary 固件**不支持**;
    本脚本只发相位(0–31,32=关闭),与官方 `sendPhases` 一致。
 5. 上板前建议永远先 `--preview` 确认声场形状、焦点位置正确。

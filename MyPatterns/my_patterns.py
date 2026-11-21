@@ -64,6 +64,18 @@ def _wrap(p):
     return np.mod(p, 2.0 * np.pi)
 
 
+def phase_payload(phases):
+    """Return the 256 phase bytes sent between the start and commit markers."""
+    ph = np.asarray(phases, float)
+    if ph.shape != (N_EMITTERS,):
+        raise ValueError(f"need {N_EMITTERS} phases, got {ph.shape}")
+    off = np.isnan(ph)
+    with np.errstate(invalid="ignore"):
+        q = np.rint(_wrap(ph) * PHASE_DIVS / (2.0 * np.pi)) % PHASE_DIVS
+    q[off] = PHASE_DIVS
+    return q.astype(np.uint8).tobytes()
+
+
 # ======================================================================
 # 一、图案库 —— 每个函数返回 256 个相位(弧度,0..2π;NaN 表示关闭)
 # ======================================================================
@@ -172,6 +184,12 @@ def phases_multipoint(points, amps=None, iters=20):
         x = f @ Gb                     # 反传回发射面
         x /= np.abs(x)                 # 发射面约束: 等幅(纯相位阵列)
     return _wrap(np.angle(x))
+
+
+def _xz_at_height(xz, height):
+    """Convert user-facing (x, z) pairs to the solver's (x, y, z) order."""
+    xz = np.asarray(xz, float).reshape(-1, 2)
+    return np.column_stack((xz[:, 0], np.full(len(xz), height), xz[:, 1]))
 
 
 # ----------------------------------------------------------------------
@@ -444,6 +462,88 @@ def field_at(points, phases):
     return _propagators(points).T @ src
 
 
+def focus_probe_points(height=0.12, offset=0.04):
+    """Fixed test positions for checking the physical +X/+Z directions."""
+    if not np.isfinite(height) or not 0.07 <= height <= 0.20:
+        raise ValueError("probe height must be 0.07-0.20 m")
+    if not np.isfinite(offset) or not 0.01 <= offset <= 0.06:
+        raise ValueError("probe offset must be 0.01-0.06 m")
+    return [("CENTER", (0.0, height, 0.0)),
+            ("+X", (offset, height, 0.0)),
+            ("-X", (-offset, height, 0.0)),
+            ("+Z", (0.0, height, offset)),
+            ("-Z", (0.0, height, -offset))]
+
+
+def probe_field_peaks(pos, half=0.09, step=0.002):
+    """Return predicted main and strongest remote peak on the target-height plane."""
+    axis = np.arange(-half, half + step / 2, step)
+    x, z = np.meshgrid(axis, axis)
+    points = np.column_stack((x.ravel(), np.full(x.size, pos[1]), z.ravel()))
+    amplitude = np.abs(field_at(points, phases_focus(pos)))
+    main = int(np.argmax(amplitude))
+    remote = np.hypot(points[:, 0] - pos[0], points[:, 2] - pos[2]) > 0.02
+    secondary = np.flatnonzero(remote)[np.argmax(amplitude[remote])]
+    return points[main], points[secondary], float(amplitude[secondary] / amplitude[main])
+
+
+def run_focus_probe(board, points, duration, read_input=input, wait=time.sleep,
+                    freq=None, duty=0.2, phase_for_position=phases_focus,
+                    live_update=False):
+    """Emit bounded focus stages, turning off between them and on interruption."""
+    if not 0 < duration <= 15:
+        raise ValueError("probe duration must be in (0, 15] seconds")
+    if freq is not None and (not 100 <= freq <= 200 or not 0 < duty <= 0.5):
+        raise ValueError("probe modulation requires 100-200 Hz and duty <= 0.5")
+    if live_update and freq is None:
+        raise ValueError("live-update probe requires modulation")
+    off = np.full(N_EMITTERS, np.nan)
+    try:
+        board.off()
+        if live_update:
+            mod = Modulator(board, off, freq=freq, duty=duty).start()
+            try:
+                for name, pos in points:
+                    answer = read_input(
+                        f"{name} ({pos[0]:+.2f}, {pos[1]:.2f}, {pos[2]:+.2f}) m: "
+                        "press Enter to emit, q then Enter to stop: ")
+                    if answer.strip().lower() == "q":
+                        break
+                    mod.set_pattern(phase_for_position(pos))
+                    try:
+                        wait(duration)
+                    finally:
+                        mod.set_pattern(off)
+                    if mod.error is not None:
+                        raise RuntimeError("probe modulation failed") from mod.error
+            finally:
+                mod.stop()
+            return
+        for name, pos in points:
+            answer = read_input(f"{name} ({pos[0]:+.2f}, {pos[1]:.2f}, {pos[2]:+.2f}) m: "
+                                "press Enter to emit, q then Enter to stop: ")
+            if answer.strip().lower() == "q":
+                break
+            mod = None
+            try:
+                phases = phase_for_position(pos)
+                if freq is None:
+                    board.send(phases)
+                else:
+                    mod = Modulator(board, phases, freq=freq, duty=duty).start()
+                wait(duration)
+            finally:
+                try:
+                    if mod is not None:
+                        mod.stop()
+                finally:
+                    board.off()
+            if mod is not None and mod.error is not None:
+                raise RuntimeError("probe modulation failed") from mod.error
+    finally:
+        board.off()
+
+
 def preview_slice(phases, axis="y", at=0.16, half=0.09, res=110,
                   title="field", targets=None, save=None, show=True):
     """预览当前相位下的声场幅度切片。
@@ -555,13 +655,7 @@ class Board:
 
     def send(self, phases):
         """发送一副相位并 commit(253)。phases: 256 个弧度;NaN → 关闭该通道。"""
-        ph = np.asarray(phases, float)
-        assert ph.shape == (N_EMITTERS,), f"need {N_EMITTERS} phases, got {ph.shape}"
-        off = np.isnan(ph)
-        with np.errstate(invalid="ignore"):
-            q = np.rint(_wrap(ph) * PHASE_DIVS / (2.0 * np.pi)) % PHASE_DIVS
-        q[off] = PHASE_DIVS
-        self._write(bytes([254]) + q.astype(np.uint8).tobytes() + bytes([253]))
+        self._write(bytes([254]) + phase_payload(phases) + bytes([253]))
 
     def off(self):
         self.send(np.full(N_EMITTERS, np.nan))
@@ -716,8 +810,8 @@ def frames_vortex_spin(dist=0.16, m=1, n=72):
 
 def frames_alternate(points_a, points_b, dist=0.16):
     """时分复用: 两组焦点交替 → 一颗阵列"同时"悬浮多个点。"""
-    a = phases_multipoint(np.column_stack([points_a, np.full(len(points_a), dist)]))
-    b = phases_multipoint(np.column_stack([points_b, np.full(len(points_b), dist)]))
+    a = phases_multipoint(_xz_at_height(points_a, dist))
+    b = phases_multipoint(_xz_at_height(points_b, dist))
     while True:
         yield a
         yield b
@@ -907,6 +1001,25 @@ def _build_parser():
     sp("ports", help="列出串口")
     sp("off", help="关闭发射")
 
+    s = sp("focusprobe", help="限时触觉焦点方向检查:中心、±X、±Z")
+    s.set_defaults(dist=0.12)
+    s.add_argument("--offset", type=float, default=0.04,
+                   help="离中心的横向距离 [m],默认 0.04")
+    s.add_argument("--dur", type=float, default=8.0,
+                   help="每个焦点的发射时间 [s],默认 8,最多 15")
+    s.add_argument("--freq", type=float, default=200.0,
+                   help="触觉开关调制频率 [Hz],默认 200")
+    s.add_argument("--duty", type=float, default=0.2,
+                   help="调制开通占空比,默认 0.2,最多 0.5")
+    s.add_argument("--static", action="store_true",
+                   help="关闭开关调制,用连续静态声场对照")
+    s.add_argument("--live-update", action="store_true",
+                   help="五步共用一个调制器,按手部跟踪的 set_pattern 路径换焦点")
+    s.add_argument("--algorithm", choices=("normal", "suppress"), default="normal",
+                   help="suppress=实验性近场副峰抑制;仅此限时测试命令可用")
+    s.add_argument("--point", type=float, nargs=2, metavar=("X", "Z"),
+                   help="仅测试指定 x/z 点 [m],用于对角点对照")
+
     s = sp("focus", help="单焦点")
     s.add_argument("x", type=float, nargs="?", default=0.0)
     s.add_argument("z", type=float, nargs="?", default=0.0)
@@ -1032,6 +1145,61 @@ def main(argv=None):
     if args.cmd == "ports":
         Board.list_ports()
         return
+    if args.cmd == "focusprobe":
+        try:
+            points = focus_probe_points(args.dist, args.offset)
+            if args.point is not None:
+                x, z = args.point
+                if not np.isfinite([x, z]).all() or max(abs(x), abs(z)) > 0.06:
+                    raise ValueError("probe point x/z must be within +/-0.06 m")
+                points = [("CUSTOM", (x, args.dist, z))]
+            if not 0 < args.dur <= 15:
+                raise ValueError("probe duration must be in (0, 15] seconds")
+            if not args.static and (not 100 <= args.freq <= 200
+                                    or not 0 < args.duty <= 0.5):
+                raise ValueError("probe modulation requires 100-200 Hz and duty <= 0.5")
+            if args.static and args.live_update:
+                raise ValueError("--live-update 不能与 --static 同用")
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        mode = ("静态" if args.static else
+                f"{args.freq:g}Hz/{args.duty:.0%} 调制")
+        print(f"阵列坐标方向检查({mode};{args.algorithm};"
+              f"每点 {args.dur:g}s 后自动关闭):")
+        selected_phases = {}
+        if args.algorithm == "suppress":
+            from acoustic_optimization import suppress_off_axis_peaks
+        for name, pos in points:
+            main, secondary, ratio = probe_field_peaks(pos)
+            print(f"  {name:6s} requested x={pos[0]:+.3f} z={pos[2]:+.3f}m; "
+                  f"model main=({main[0]:+.3f},{main[2]:+.3f}), "
+                  f"remote=({secondary[0]:+.3f},{secondary[2]:+.3f}) "
+                  f"at {ratio:.0%} main pressure")
+            if args.algorithm == "suppress":
+                selected_phases[pos], report = suppress_off_axis_peaks(pos)
+                baseline, optimized = report["baseline"], report["optimized"]
+                print(f"    suppress model 3D remote ratio "
+                      f"{baseline['remote_ratio']:.0%} -> "
+                      f"{optimized['remote_ratio']:.0%}; target pressure "
+                      f"{optimized['target_pressure'] / baseline['target_pressure']:.0%}; "
+                      f"{'optimized' if report['improved'] else 'normal fallback'}")
+                remote = optimized["remote_position"]
+                print(f"    strongest remote at x={remote[0]:+.3f}, "
+                      f"y={remote[1]:.3f}, z={remote[2]:+.3f}m "
+                      "in the checked volume")
+        if args.dry:
+            return
+        if not args.port:
+            raise SystemExit("focusprobe 实物测试须显式指定 --port")
+        with Board(args.port) as board:
+            run_focus_probe(board, points, args.dur,
+                            freq=None if args.static else args.freq,
+                            duty=args.duty,
+                            phase_for_position=(lambda pos: selected_phases[pos])
+                            if args.algorithm == "suppress" else phases_focus,
+                            live_update=args.live_update)
+        print("focusprobe 结束:已关闭发射")
+        return
 
     # ---- 计算相位 ----
     pos = (getattr(args, "x", 0.0), args.dist, getattr(args, "z", 0.0))
@@ -1054,7 +1222,7 @@ def main(argv=None):
         if len(args.xz) < 4 or len(args.xz) % 2:
             raise SystemExit("points 需要成对的 x z,例: points 0.03 0 -0.03 0")
         pts = np.array(args.xz, float).reshape(-1, 2)
-        pts3 = np.column_stack([pts, np.full(len(pts), args.dist)])
+        pts3 = _xz_at_height(pts, args.dist)
         phases, title = phases_multipoint(pts3), f"IBP {len(pts)} points"
         targets = pts3.tolist()
     elif args.cmd == "image":
